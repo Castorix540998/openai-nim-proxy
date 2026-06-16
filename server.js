@@ -21,7 +21,7 @@ const RETRY_CONFIG = {
 // ===== TOKEN-BASED THROTTLING CONFIGURATION =====
 // This helps avoid invisible resource limits on NVIDIA's free tier
 const TOKEN_CONFIG = {
-  maxTokensPerSecond: 50,     // Reduced to 50 tokens/sec for more conservative throttling
+  maxTokensPerSecond: 17,     // Reduced to 50 tokens/sec for more conservative throttling
   tokensUsedInLastSecond: 0,
   lastTokenResetTime: Date.now()
 };
