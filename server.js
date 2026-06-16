@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy (Full Context Preservation)
+// server.js - OpenAI to NVIDIA NIM API Proxy (Aggressive Rate Limiting)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -7,14 +7,14 @@ const pLimit = require('p-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Rate limiting setup
-const limiter = pLimit(2);
+// Rate limiting setup - SINGLE concurrent request to be safe
+const limiter = pLimit(1);
 
-// Retry configuration
+// Retry configuration with MUCH longer waits
 const RETRY_CONFIG = {
-  maxRetries: 5,
-  initialDelay: 1000,
-  maxDelay: 60000,
+  maxRetries: 3,        // Reduced retries to avoid wasting time
+  initialDelay: 10000,  // Start with 10 seconds
+  maxDelay: 60000,      // Up to 60 seconds
   backoffFactor: 2,
   jitter: true
 };
@@ -48,61 +48,75 @@ class TokenBucket {
     const tokensNeeded = tokens - this.tokens;
     const waitTime = Math.ceil((tokensNeeded / this.refillRate) * this.refillInterval);
     
-    console.log(`⏳ Token bucket: Need ${tokensNeeded} more tokens. Waiting ${waitTime}ms...`);
-    await sleep(Math.min(waitTime, 10000));
+    console.log(`⏳ Rate limit cooldown: Waiting ${Math.round(waitTime/1000)}s before next request...`);
+    await sleep(Math.min(waitTime, 30000));
     this.refill();
     this.tokens -= tokens;
     return true;
   }
 }
 
-const requestBucket = new TokenBucket(30, 1, 1000);
+// VERY conservative rate limiting: 5 requests per minute
+const requestBucket = new TokenBucket(5, 1, 12000); // 1 token every 12 seconds = 5/min
 
-// ===== CONTEXT MANAGEMENT CONFIGURATION =====
-const MAX_TOKENS_PER_REQUEST = 4000;
-const SUMMARY_TRIGGER_TOKENS = 3000; // Start summarizing when we hit this threshold
-const SUMMARY_RESERVE_TOKENS = 1000; // Reserve tokens for the summary itself
+// ===== AGGRESSIVE CONTEXT MANAGEMENT =====
+const MAX_TOKENS_PER_REQUEST = 2000; // MUCH more aggressive limit
+const SUMMARY_TRIGGER_TOKENS = 1500; // Start summarizing earlier
+const SUMMARY_MAX_TOKENS = 800; // Keep summaries focused
 
 // ===== CONTEXT SUMMARIZATION SYSTEM =====
 class ConversationSummarizer {
   constructor() {
-    this.summaries = new Map(); // Store summaries per conversation
+    this.lastSummary = null;
+    this.summaryCache = new Map();
   }
 
   async summarizeConversation(messages, nimModel) {
-    // Extract key information from the conversation
+    // Check if we already have a recent summary
+    const conversationKey = JSON.stringify(messages.slice(-5)); // Use last 5 messages as key
+    if (this.summaryCache.has(conversationKey)) {
+      console.log('📝 Using cached summary...');
+      return this.summaryCache.get(conversationKey);
+    }
+
     const systemMessages = messages.filter(m => m.role === 'system');
     const conversationMessages = messages.filter(m => m.role !== 'system');
     
-    // Create a summary prompt that captures all important context
+    // Create an ultra-focused summary prompt
     const summaryPrompt = {
       role: 'system',
-      content: `You are a conversation summarizer. Create a detailed summary of the following conversation that captures:
-1. ALL character personalities, traits, and backgrounds mentioned
-2. ALL important events, plot points, and story developments
-3. ALL key relationships between characters
-4. ALL important decisions or choices made
-5. The current situation and ongoing context
-6. Any rules, settings, or world-building elements established
+      content: `Create a VERY concise summary (maximum 200 words) of this conversation. Include ONLY:
+1. Current situation and immediate context
+2. Key character details (names, personalities)
+3. Last major event or decision
+4. Active plot threads
 
-Be extremely detailed and comprehensive. This summary will replace the full conversation history to save context space while maintaining continuity.`
+Be extremely brief. This is for context preservation only.`
     };
 
-    const conversationText = conversationMessages
-      .map(m => `${m.role}: ${m.content}`)
+    // Only summarize the older portion, not recent messages
+    const olderMessages = conversationMessages.slice(0, -6); // Exclude last 3 exchanges
+    if (olderMessages.length === 0) return null;
+
+    const conversationText = olderMessages
+      .slice(-20) // Only look at last 20 older messages
+      .map(m => `${m.role}: ${m.content.substring(0, 200)}`) // Truncate each message
       .join('\n\n');
 
     const summaryRequest = {
       model: nimModel,
       messages: [
         summaryPrompt,
-        { role: 'user', content: `Please summarize this conversation while preserving ALL important context:\n\n${conversationText}` }
+        { role: 'user', content: `Summarize this:\n\n${conversationText}` }
       ],
       temperature: 0.3,
-      max_tokens: 2000
+      max_tokens: SUMMARY_MAX_TOKENS
     };
 
     try {
+      // Wait for rate limit cooldown before summarization request
+      await requestBucket.consume(1);
+      
       const response = await axios.post(`${NIM_API_BASE}/chat/completions`, summaryRequest, {
         headers: {
           'Authorization': `Bearer ${NIM_API_KEY}`,
@@ -116,9 +130,12 @@ Be extremely detailed and comprehensive. This summary will replace the full conv
       // Create a system message that includes the summary
       const contextMessage = {
         role: 'system',
-        content: `[PREVIOUS CONVERSATION SUMMARY - Maintain continuity with this context]\n\n${summary}\n\n[END SUMMARY - Continue the conversation naturally based on this context]`
+        content: `[CONTEXT: ${summary.substring(0, 300)}]` // Even shorter context
       };
 
+      // Cache the summary
+      this.summaryCache.set(conversationKey, contextMessage);
+      
       return contextMessage;
     } catch (error) {
       console.error('❌ Summarization failed:', error.message);
@@ -136,13 +153,13 @@ Be extremely detailed and comprehensive. This summary will replace the full conv
       return messages;
     }
 
-    console.log(`🔄 Conversation too large (${estimatedTokens} tokens). Compressing...`);
+    console.log(`🔄 Conversation too large (${estimatedTokens} tokens). Aggressive compression...`);
 
     const systemMessages = messages.filter(m => m.role === 'system');
     const conversationMessages = messages.filter(m => m.role !== 'system');
     
-    // Keep the last few exchanges intact (most recent context)
-    const RECENT_EXCHANGES = 3; // Keep last 3 complete exchanges
+    // AGGRESSIVE: Keep only last 2 exchanges intact
+    const RECENT_EXCHANGES = 2;
     let recentStartIndex = conversationMessages.length;
     let exchangeCount = 0;
     
@@ -159,7 +176,19 @@ Be extremely detailed and comprehensive. This summary will replace the full conv
     const olderMessages = conversationMessages.slice(0, recentStartIndex);
     const recentMessages = conversationMessages.slice(recentStartIndex);
     
-    // Summarize older messages
+    // Ultra-aggressive: If still too large, truncate recent messages
+    let processedRecent = recentMessages;
+    const recentTokens = estimateTokens(JSON.stringify([...systemMessages, ...recentMessages]));
+    if (recentTokens > MAX_TOKENS_PER_REQUEST - 200) {
+      // Truncate content of recent messages
+      processedRecent = recentMessages.map(msg => ({
+        ...msg,
+        content: msg.content.substring(0, 300) + (msg.content.length > 300 ? '...' : '')
+      }));
+      console.log('⚠️ Truncated recent message contents to fit limits');
+    }
+    
+    // Try to summarize older messages
     if (olderMessages.length > 0) {
       console.log(`📝 Summarizing ${olderMessages.length} older messages...`);
       const summaryMessage = await this.summarizeConversation(
@@ -170,45 +199,34 @@ Be extremely detailed and comprehensive. This summary will replace the full conv
       if (summaryMessage) {
         // Combine: system messages + summary + recent messages
         const compressedMessages = [
-          ...systemMessages,
+          ...systemMessages.slice(0, 1), // Keep only first system message
           summaryMessage,
-          ...recentMessages
+          ...processedRecent
         ];
         
         const compressedTokens = estimateTokens(JSON.stringify(compressedMessages));
         console.log(`✅ Compressed from ${estimatedTokens} to ${compressedTokens} tokens`);
         
+        // FINAL CHECK: If still too large, emergency truncation
+        if (compressedTokens > MAX_TOKENS_PER_REQUEST) {
+          console.log('🚨 Emergency truncation needed!');
+          return [
+            ...systemMessages.slice(0, 1),
+            summaryMessage,
+            processedRecent[processedRecent.length - 1] // Just the very last message
+          ];
+        }
+        
         return compressedMessages;
       }
     }
     
-    // If summarization fails, fall back to smart truncation
-    console.log('⚠️ Falling back to smart truncation...');
-    return this.smartTruncate(messages);
-  }
-
-  smartTruncate(messages) {
-    const systemMessages = messages.filter(m => m.role === 'system');
-    const conversationMessages = messages.filter(m => m.role !== 'system');
-    
-    const systemTokens = systemMessages.reduce((sum, msg) => sum + estimateTokens(msg.content), 0);
-    let availableTokens = MAX_TOKENS_PER_REQUEST - systemTokens - 500;
-    
-    const selectedMessages = [];
-    let tokensUsed = 0;
-    
-    // Work backwards to include most recent messages
-    for (let i = conversationMessages.length - 1; i >= 0; i--) {
-      const msgTokens = estimateTokens(conversationMessages[i].content);
-      if (tokensUsed + msgTokens <= availableTokens) {
-        selectedMessages.unshift(conversationMessages[i]);
-        tokensUsed += msgTokens;
-      } else {
-        break;
-      }
-    }
-    
-    return [...systemMessages, ...selectedMessages];
+    // Fallback: Ultra-aggressive truncation
+    console.log('⚠️ Using emergency truncation...');
+    return [
+      ...systemMessages.slice(0, 1),
+      ...processedRecent.slice(-4) // Just last 2 exchanges
+    ];
   }
 }
 
@@ -243,12 +261,15 @@ async function callWithRetry(fn, context = '') {
         throw error;
       }
       
-      let retryAfter = error.response?.headers?.['retry-after'];
+      // FIXED: Better Retry-After handling
       let waitTime;
+      const retryAfter = error.response?.headers?.['retry-after'];
       
       if (retryAfter) {
         waitTime = parseInt(retryAfter) * 1000;
+        console.log(`⚠️ ${context} Got Retry-After header: ${retryAfter}s`);
       } else {
+        // Exponential backoff with jitter, starting from 10s
         waitTime = RETRY_CONFIG.initialDelay * Math.pow(RETRY_CONFIG.backoffFactor, attempt);
         if (RETRY_CONFIG.jitter) {
           waitTime = waitTime * (0.5 + Math.random() * 0.5);
@@ -320,12 +341,10 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'OpenAI to NVIDIA NIM Proxy',
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE,
     bucket_tokens: requestBucket.tokens,
     bucket_capacity: requestBucket.capacity,
     max_tokens_per_request: MAX_TOKENS_PER_REQUEST,
-    context_preservation: 'summarization'
+    rate_limit: '5 requests/minute'
   });
 });
 
@@ -348,28 +367,41 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
-    const clientIp = req.ip || req.connection.remoteAddress;
     
     // Smart model selection
     const nimModel = await resolveModel(model);
     
     // Estimate total tokens
     const estimatedTokens = estimateTokens(JSON.stringify(messages));
-    console.log(`📊 Estimated total tokens: ${estimatedTokens}`);
+    console.log(`📊 Estimated input tokens: ${estimatedTokens}`);
     
-    // MAIN FIX: Use summarization to preserve full context
+    // AGGRESSIVE: Always compress if over limit
     let processedMessages = messages;
-    if (estimatedTokens > SUMMARY_TRIGGER_TOKENS) {
-      console.log(`🔄 Conversation getting long (${estimatedTokens} tokens). Applying context preservation...`);
+    if (estimatedTokens > MAX_TOKENS_PER_REQUEST) {
+      console.log(`🔄 Compressing conversation (${estimatedTokens} tokens)...`);
       processedMessages = await summarizer.compressConversation(messages, nimModel);
+      
+      const compressedTokens = estimateTokens(JSON.stringify(processedMessages));
+      console.log(`📦 Final request size: ${compressedTokens} tokens`);
+      
+      // If STILL too large after compression, reject with helpful error
+      if (compressedTokens > MAX_TOKENS_PER_REQUEST * 1.2) {
+        return res.status(413).json({
+          error: {
+            message: 'Conversation too large even after compression. Please start a new conversation or reduce context.',
+            type: 'context_too_large',
+            code: 413
+          }
+        });
+      }
     }
     
-    // Prepare the request
+    // Prepare the request with REDUCED max_tokens
     const nimRequest = {
       model: nimModel,
       messages: processedMessages,
       temperature: temperature || 0.6,
-      max_tokens: max_tokens || 4096,
+      max_tokens: Math.min(max_tokens || 2048, 2048), // MAX 2048 tokens for response
       stream: stream || false
     };
     
@@ -377,7 +409,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
     }
     
-    // Use token bucket for rate limiting
+    // Use token bucket for rate limiting (5 req/min)
+    console.log('⏳ Waiting for rate limit cooldown...');
     await requestBucket.consume(1);
     
     const response = await limiter(async () => {
@@ -394,83 +427,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       );
     });
     
+    // Reset bucket on successful request
+    console.log('✅ Request successful');
+    
     if (stream) {
-      // Handle streaming response
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       
-      let buffer = '';
-      let reasoningStarted = false;
-      let isFirstContent = true;
+      response.data.pipe(res);
       
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        
-        lines.forEach(line => {
-          if (line.startsWith('data: ')) {
-            if (line.includes('[DONE]')) {
-              res.write(line + '\n');
-              return;
-            }
-            
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
-                const content = data.choices[0].delta.content;
-                
-                // Filter out conversation completion attempts
-                if (content && isFirstContent) {
-                  isFirstContent = false;
-                  if (content.startsWith('Human:') || content.startsWith('User:') || 
-                      content.match(/^(Assistant|AI|Bot):/)) {
-                    console.warn('⚠️ Filtered conversation completion prefix');
-                    return;
-                  }
-                }
-                
-                if (SHOW_REASONING) {
-                  let combinedContent = '';
-                  
-                  if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\n' + reasoning;
-                    reasoningStarted = true;
-                  } else if (reasoning) {
-                    combinedContent = reasoning;
-                  }
-                  
-                  if (content && reasoningStarted) {
-                    combinedContent += '</think>\n\n' + content;
-                    reasoningStarted = false;
-                  } else if (content) {
-                    combinedContent += content;
-                  }
-                  
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
-                  }
-                } else {
-                  if (content) {
-                    data.choices[0].delta.content = content;
-                  } else {
-                    data.choices[0].delta.content = '';
-                  }
-                  delete data.choices[0].delta.reasoning_content;
-                }
-              }
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
-            } catch (e) {
-              res.write(line + '\n');
-            }
-          }
-        });
-      });
-      
-      response.data.on('end', () => res.end());
       response.data.on('error', (err) => {
         console.error('Stream error:', err);
         if (!res.headersSent) {
@@ -479,10 +445,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      // Transform NIM response to OpenAI format
       let responseContent = response.data.choices[0]?.message?.content || '';
       
-      // Clean up any conversation completion artifacts
+      // Clean up any artifacts
       responseContent = responseContent.replace(/^(?:Human|User|Assistant|AI|Bot):\s*/gm, '');
       
       const openaiResponse = {
@@ -505,17 +470,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       };
       
-      // Handle reasoning content if enabled
-      if (SHOW_REASONING && response.data.choices[0]?.message?.reasoning_content) {
-        const reasoning = response.data.choices[0].message.reasoning_content;
-        openaiResponse.choices[0].message.content = 
-          '<think>\n' + reasoning + '\n</think>\n\n' + responseContent;
-      }
-      
-      // Log token usage
       if (response.data.usage) {
-        const totalTokens = response.data.usage.total_tokens || 0;
-        console.log(`📊 Total tokens used: ${totalTokens}`);
+        console.log(`📊 Tokens: ${response.data.usage.total_tokens} total`);
       }
       
       res.json(openaiResponse);
@@ -526,30 +482,35 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     if (error.response) {
       console.error(`   Status: ${error.response.status}`);
-      console.error(`   Data:`, JSON.stringify(error.response.data, null, 2));
+      if (error.response.status === 429) {
+        console.error('   ⚠️ RATE LIMITED - Request too large or too frequent');
+        console.error('   Solution: Reduce conversation size or wait longer between requests');
+      }
     }
     
     const status = error.response?.status || 500;
     const retryAfter = error.response?.headers?.['retry-after'];
     
     if (status === 429) {
+      // Aggressive cooldown after 429
       requestBucket.tokens = 0;
-      res.setHeader('Retry-After', retryAfter || '30');
+      res.setHeader('Retry-After', '60'); // Force 60 second cooldown
     }
     
     res.status(status).json({
       error: {
-        message: error.response?.data?.error?.message || error.message || 'Internal server error',
-        type: status === 429 ? 'rate_limit_error' : 
-              status === 401 ? 'authentication_error' : 'invalid_request_error',
+        message: status === 429 
+          ? 'Rate limit exceeded. Your request is too large. Try reducing conversation length or wait 60 seconds.'
+          : error.message || 'Internal server error',
+        type: status === 429 ? 'rate_limit_error' : 'invalid_request_error',
         code: status,
-        retry_after: retryAfter ? parseInt(retryAfter) : null
+        retry_after: retryAfter ? parseInt(retryAfter) : 60
       }
     });
   }
 });
 
-// Catch-all for unsupported endpoints
+// Catch-all
 app.all('*', (req, res) => {
   res.status(404).json({
     error: {
@@ -562,11 +523,8 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`📊 Rate limiting: Token bucket (30 req/min, refill 1/sec)`);
-  console.log(`🔄 Concurrent requests: 2 max`);
-  console.log(`🧠 Context preservation: Intelligent summarization`);
-  console.log(`📝 Summarization triggers at: ${SUMMARY_TRIGGER_TOKENS} tokens`);
-  console.log(`💾 Recent exchanges preserved: Last 3 exchanges always intact`);
+  console.log(`🐌 Rate limiting: 5 requests per minute (1 per 12 seconds)`);
+  console.log(`📦 Max tokens per request: ${MAX_TOKENS_PER_REQUEST}`);
+  console.log(`✂️ Aggressive compression: Enabled`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
-  console.log(`🔍 Health check: http://localhost:${PORT}/health`);
 });
