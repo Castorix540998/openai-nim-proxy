@@ -12,16 +12,16 @@ const limiter = pLimit(1); // Process one request at a time
 
 // Retry configuration - more aggressive retry with longer waits
 const RETRY_CONFIG = {
-  maxRetries: 5,        // Try up to 5 times
+  maxRetries: 3,        // Reduced to 3 to avoid wasting time on huge requests
   initialDelay: 5000,   // Wait 5 seconds before first retry
-  maxDelay: 60000,      // Wait up to 60 seconds
+  maxDelay: 30000,      // Wait up to 30 seconds
   backoffFactor: 2      // Double the wait time each retry
 };
 
 // ===== TOKEN-BASED THROTTLING CONFIGURATION =====
 // This helps avoid invisible resource limits on NVIDIA's free tier
 const TOKEN_CONFIG = {
-  maxTokensPerSecond: 80,     // Start with 80 tokens/sec, adjust based on your observations
+  maxTokensPerSecond: 50,     // Reduced to 50 tokens/sec for more conservative throttling
   tokensUsedInLastSecond: 0,
   lastTokenResetTime: Date.now()
 };
@@ -31,7 +31,7 @@ const TOKEN_CONFIG = {
 // Sleep function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Token-based throttling to avoid invisible resource limits
+// CORRECTED: Token-based throttling to avoid invisible resource limits
 async function throttleTokens(tokensToUse) {
   const now = Date.now();
   const timeSinceReset = now - TOKEN_CONFIG.lastTokenResetTime;
@@ -40,11 +40,17 @@ async function throttleTokens(tokensToUse) {
   if (timeSinceReset >= 1000) {
     TOKEN_CONFIG.tokensUsedInLastSecond = 0;
     TOKEN_CONFIG.lastTokenResetTime = now;
+    // Reset the timeSinceReset to 0 after reset
+    timeSinceReset = 0;
   }
   
   // Check if we would exceed the limit
   if (TOKEN_CONFIG.tokensUsedInLastSecond + tokensToUse > TOKEN_CONFIG.maxTokensPerSecond) {
-    const waitTime = 1000 - timeSinceReset + 50; // Wait until next second + 50ms buffer
+    // Calculate wait time - ensure it's always positive
+    let waitTime = 1000 - timeSinceReset;
+    if (waitTime < 100) waitTime = 100; // Minimum 100ms wait
+    waitTime = Math.min(waitTime, 5000); // Maximum 5 seconds wait
+    
     console.log(`⏳ Token throttling: ${tokensToUse} tokens would exceed ${TOKEN_CONFIG.maxTokensPerSecond}/s. Waiting ${waitTime}ms...`);
     await sleep(waitTime);
     // Reset after waiting
@@ -58,7 +64,6 @@ async function throttleTokens(tokensToUse) {
 // Helper: Roughly estimate token count (approximation for throttling)
 function estimateTokens(text) {
   if (!text) return 0;
-  // Conservative estimate: ~4 characters per token for English
   const length = typeof text === 'string' ? text.length : JSON.stringify(text).length;
   return Math.ceil(length / 4) + 10;
 }
@@ -72,12 +77,12 @@ function estimateMessagesTokens(messages) {
     total += estimateTokens(msg.role || '');
     if (msg.name) total += estimateTokens(msg.name);
   }
-  return total + 20; // Overhead for conversation structure
+  return total + 20;
 }
 
 // Request throttling - enforce minimum time between requests
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 3000; // 3 seconds between requests
+const MIN_REQUEST_INTERVAL = 5000; // Increased to 5 seconds between requests
 
 // Helper: throttle requests to avoid rate limits
 async function throttleRequest() {
@@ -220,6 +225,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Smart model selection with fallback (NO test request)
     const nimModel = await resolveModel(model);
     
+    // Check for huge request - warn if too large
+    const estimatedInputTokens = estimateMessagesTokens(messages);
+    console.log(`📊 Estimated input tokens: ${estimatedInputTokens}`);
+    
+    if (estimatedInputTokens > 2000) {
+      console.warn(`⚠️ Large request detected: ${estimatedInputTokens} tokens. This may trigger rate limits.`);
+      // For very large requests, add extra delay
+      if (estimatedInputTokens > 5000) {
+        const extraDelay = Math.min(10000, estimatedInputTokens * 2);
+        console.log(`⏳ Large request: Adding ${extraDelay}ms extra delay...`);
+        await sleep(extraDelay);
+      }
+    }
+    
     // Transform OpenAI request to NIM format
     const nimRequest = {
       model: nimModel,
@@ -237,10 +256,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Throttle requests to avoid rate limits
     await throttleRequest();
     
-    // Estimate token usage and throttle based on tokens
-    const estimatedInputTokens = estimateMessagesTokens(messages);
-    console.log(`📊 Estimated input tokens: ${estimatedInputTokens}`);
-    await throttleTokens(estimatedInputTokens + 100); // Add 100 for response buffer
+    // Estimate token usage and throttle based on tokens (with reduced buffer for large requests)
+    let tokenBuffer = 100;
+    if (estimatedInputTokens > 5000) tokenBuffer = 50; // Smaller buffer for huge requests
+    if (estimatedInputTokens > 10000) tokenBuffer = 20;
+    
+    await throttleTokens(estimatedInputTokens + tokenBuffer);
     
     // Make request to NVIDIA NIM API with concurrency limiting and retry logic
     const response = await limiter(async () => {
@@ -374,17 +395,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     const retryAfter = error.response?.headers?.['retry-after'];
     
     if (status === 429) {
-      res.setHeader('Retry-After', retryAfter || '5');
+      res.setHeader('Retry-After', retryAfter || '30');
     }
     
     res.status(status).json({
       error: {
         message: status === 429 
-          ? 'Rate limit exceeded. Please wait before sending more requests.'
+          ? 'Rate limit exceeded. Your request is too large or too frequent. Please wait and try again.'
           : error.message || 'Internal server error',
         type: status === 429 ? 'rate_limit_error' : 'invalid_request_error',
         code: status,
-        retry_after: retryAfter ? parseInt(retryAfter) : null
+        retry_after: retryAfter ? parseInt(retryAfter) : 30
       }
     });
   }
