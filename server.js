@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy (Improved Rate Limiting & Chunking)
+// server.js - OpenAI to NVIDIA NIM API Proxy (Fixed Context & Chunking)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -12,11 +12,11 @@ const limiter = pLimit(2); // Allow 2 concurrent requests initially
 
 // Retry configuration with exponential backoff
 const RETRY_CONFIG = {
-  maxRetries: 5,        // More retries with better backoff
-  initialDelay: 1000,   // Start with 1 second
-  maxDelay: 60000,      // Up to 60 seconds
-  backoffFactor: 2,     // Double each time
-  jitter: true          // Add randomness to prevent thundering herd
+  maxRetries: 5,
+  initialDelay: 1000,
+  maxDelay: 60000,
+  backoffFactor: 2,
+  jitter: true
 };
 
 // ===== TOKEN BUCKET FOR RATE LIMITING =====
@@ -45,117 +45,88 @@ class TokenBucket {
       return true;
     }
     
-    // Calculate wait time until tokens are available
     const tokensNeeded = tokens - this.tokens;
     const waitTime = Math.ceil((tokensNeeded / this.refillRate) * this.refillInterval);
     
     console.log(`⏳ Token bucket: Need ${tokensNeeded} more tokens. Waiting ${waitTime}ms...`);
-    await sleep(Math.min(waitTime, 10000)); // Max 10 second wait
+    await sleep(Math.min(waitTime, 10000));
     this.refill();
     this.tokens -= tokens;
     return true;
   }
 }
 
-// Create token bucket: 30 tokens max, refill 1 token per second (30 requests per minute)
 const requestBucket = new TokenBucket(30, 1, 1000);
 
-// ===== REQUEST CHUNKING CONFIGURATION =====
-const MAX_TOKENS_PER_REQUEST = 4000; // Maximum tokens per request to avoid 429 errors
+// ===== IMPROVED REQUEST CHUNKING CONFIGURATION =====
+const MAX_TOKENS_PER_REQUEST = 4000;
 
 // ===== HELPER FUNCTIONS =====
 
-// Sleep function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Helper: Better token estimation
+// Better token estimation
 function estimateTokens(text) {
   if (!text) return 0;
   const str = typeof text === 'string' ? text : JSON.stringify(text);
-  // Better estimation: ~4 characters per token for English text
   return Math.ceil(str.length / 4);
 }
 
-// Helper: Split long conversation into chunks
-function chunkMessages(messages, maxTokens = MAX_TOKENS_PER_REQUEST) {
-  if (!messages || messages.length === 0) return [messages];
+// IMPROVED: Smart conversation chunking that preserves context
+function smartChunkConversation(messages, maxTokens = MAX_TOKENS_PER_REQUEST) {
+  if (!messages || messages.length === 0) return null;
   
-  const chunks = [];
-  let currentChunk = [];
-  let currentTokens = 0;
+  // If messages fit within limit, no chunking needed
+  const totalTokens = estimateTokens(JSON.stringify(messages));
+  if (totalTokens <= maxTokens) return null;
   
-  // Always keep system message in every chunk
   const systemMessages = messages.filter(m => m.role === 'system');
-  const nonSystemMessages = messages.filter(m => m.role !== 'system');
+  const conversationMessages = messages.filter(m => m.role !== 'system');
   
-  // Calculate system message tokens
-  const systemTokens = systemMessages.reduce((sum, msg) => 
-    sum + estimateTokens(msg.content), 0);
+  // Find the last user message
+  const lastUserMessageIndex = [...conversationMessages].reverse().findIndex(m => m.role === 'user');
+  if (lastUserMessageIndex === -1) return null; // No user message found
   
-  // Start first chunk with system messages
-  currentChunk = [...systemMessages];
-  currentTokens = systemTokens;
+  const actualLastUserIndex = conversationMessages.length - 1 - lastUserMessageIndex;
   
-  for (let i = 0; i < nonSystemMessages.length; i++) {
-    const msg = nonSystemMessages[i];
-    const msgTokens = estimateTokens(msg.content) + estimateTokens(msg.role);
-    
-    // If adding this message would exceed the limit
-    if (currentTokens + msgTokens > maxTokens && currentChunk.length > systemMessages.length) {
-      // Save current chunk
-      chunks.push([...currentChunk]);
-      
-      // Start new chunk with system messages + overlap for context
-      const overlapStart = Math.max(0, currentChunk.length - systemMessages.length - 3);
-      currentChunk = [
-        ...systemMessages,
-        ...currentChunk.slice(systemMessages.length + overlapStart)
-      ];
-      currentTokens = systemTokens + currentChunk
-        .slice(systemMessages.length)
-        .reduce((sum, m) => sum + estimateTokens(m.content), 0);
+  // Strategy: Keep all system messages + last N messages that fit within limit
+  const systemTokens = systemMessages.reduce((sum, msg) => sum + estimateTokens(msg.content), 0);
+  let availableTokens = maxTokens - systemTokens - 500; // Reserve 500 tokens for response
+  
+  // Start from the end and work backwards to include most recent context
+  const selectedMessages = [];
+  let tokensUsed = 0;
+  
+  // Always include the last user message and any assistant responses after it
+  for (let i = actualLastUserIndex; i < conversationMessages.length; i++) {
+    const msgTokens = estimateTokens(conversationMessages[i].content);
+    if (tokensUsed + msgTokens <= availableTokens) {
+      selectedMessages.push(conversationMessages[i]);
+      tokensUsed += msgTokens;
     }
-    
-    currentChunk.push(msg);
-    currentTokens += msgTokens;
   }
   
-  // Add final chunk if not empty
-  if (currentChunk.length > systemMessages.length) {
-    chunks.push(currentChunk);
+  // Then add previous messages from the last user message backwards
+  let includedCount = selectedMessages.length;
+  for (let i = actualLastUserIndex - 1; i >= 0 && tokensUsed < availableTokens; i--) {
+    const msgTokens = estimateTokens(conversationMessages[i].content);
+    if (tokensUsed + msgTokens <= availableTokens) {
+      selectedMessages.unshift(conversationMessages[i]);
+      tokensUsed += msgTokens;
+      includedCount++;
+    } else {
+      break;
+    }
   }
   
-  return chunks.length > 0 ? chunks : [messages];
-}
-
-// Helper: Combine chunked responses
-function combineChunkedResponses(responses) {
-  if (responses.length === 1) return responses[0];
+  // If we couldn't even fit the last exchange, just keep the minimum
+  if (selectedMessages.length < 2) {
+    const lastExchange = conversationMessages.slice(Math.max(0, actualLastUserIndex - 1));
+    return [...systemMessages, ...lastExchange];
+  }
   
-  // Combine all response content
-  const combinedContent = responses
-    .map(r => r.choices[0]?.message?.content || '')
-    .join('\n\n---\n\n');
-  
-  // Sum up token usage
-  const totalUsage = responses.reduce((sum, r) => ({
-    prompt_tokens: (sum.prompt_tokens || 0) + (r.usage?.prompt_tokens || 0),
-    completion_tokens: (sum.completion_tokens || 0) + (r.usage?.completion_tokens || 0),
-    total_tokens: (sum.total_tokens || 0) + (r.usage?.total_tokens || 0)
-  }), {});
-  
-  return {
-    ...responses[0],
-    choices: [{
-      index: 0,
-      message: {
-        role: 'assistant',
-        content: combinedContent
-      },
-      finish_reason: responses[responses.length - 1].choices[0]?.finish_reason || 'stop'
-    }],
-    usage: totalUsage
-  };
+  console.log(`✂️ Smart truncation: Kept ${includedCount}/${conversationMessages.length} messages (${tokensUsed} tokens)`);
+  return [...systemMessages, ...selectedMessages];
 }
 
 // Helper: Call with smart retry logic
@@ -168,7 +139,6 @@ async function callWithRetry(fn, context = '') {
     } catch (error) {
       lastError = error;
       
-      // Check if error is retryable
       const isRetryable = error.response?.status === 429 || 
                           error.response?.status === 503 || 
                           error.response?.status === 504 ||
@@ -179,17 +149,15 @@ async function callWithRetry(fn, context = '') {
         throw error;
       }
       
-      // Get retry delay from header or calculate with jitter
       let retryAfter = error.response?.headers?.['retry-after'];
       let waitTime;
       
       if (retryAfter) {
         waitTime = parseInt(retryAfter) * 1000;
       } else {
-        // Exponential backoff with jitter
         waitTime = RETRY_CONFIG.initialDelay * Math.pow(RETRY_CONFIG.backoffFactor, attempt);
         if (RETRY_CONFIG.jitter) {
-          waitTime = waitTime * (0.5 + Math.random() * 0.5); // 50-100% of calculated time
+          waitTime = waitTime * (0.5 + Math.random() * 0.5);
         }
         waitTime = Math.min(waitTime, RETRY_CONFIG.maxDelay);
       }
@@ -202,7 +170,7 @@ async function callWithRetry(fn, context = '') {
   throw lastError;
 }
 
-// Model cache to avoid repeated lookups
+// Model cache
 const modelCache = new Map();
 
 // Middleware
@@ -214,13 +182,11 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
+// 🔥 REASONING DISPLAY TOGGLE
+const SHOW_REASONING = false;
+const ENABLE_THINKING_MODE = false;
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
-
-// Model mapping (adjust based on available NIM models)
+// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'minimaxai/minimax-m3',
@@ -231,20 +197,16 @@ const MODEL_MAPPING = {
   'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b' 
 };
 
-// Helper function to resolve model without making test requests
 async function resolveModel(openaiModel) {
-  // Check cache first
   if (modelCache.has(openaiModel)) {
     return modelCache.get(openaiModel);
   }
   
-  // Check mapping
   if (MODEL_MAPPING[openaiModel]) {
     modelCache.set(openaiModel, MODEL_MAPPING[openaiModel]);
     return MODEL_MAPPING[openaiModel];
   }
   
-  // Use fallback based on model name patterns (without making API calls)
   const modelLower = openaiModel.toLowerCase();
   let fallbackModel;
   
@@ -274,7 +236,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List models endpoint (OpenAI compatible)
+// List models endpoint
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -289,7 +251,7 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// Chat completions endpoint (main proxy)
+// Chat completions endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
@@ -302,96 +264,23 @@ app.post('/v1/chat/completions', async (req, res) => {
     const estimatedTokens = estimateTokens(JSON.stringify(messages));
     console.log(`📊 Estimated total tokens: ${estimatedTokens}`);
     
-    // If request is too large and not streaming, chunk it
+    // FIXED: Use smart truncation instead of chunking to preserve context
+    let processedMessages = messages;
     if (estimatedTokens > MAX_TOKENS_PER_REQUEST && !stream) {
-      console.log(`🔄 Large request detected (${estimatedTokens} tokens). Splitting into chunks...`);
-      
-      const chunks = chunkMessages(messages);
-      console.log(`📦 Split into ${chunks.length} chunks`);
-      
-      const chunkResponses = [];
-      
-      // Process each chunk with delay between them
-      for (let i = 0; i < chunks.length; i++) {
-        console.log(`🔄 Processing chunk ${i + 1}/${chunks.length} (${estimateTokens(JSON.stringify(chunks[i]))} tokens)`);
-        
-        const nimRequest = {
-          model: nimModel,
-          messages: chunks[i],
-          temperature: temperature || 0.6,
-          max_tokens: max_tokens || 9024,
-          stream: false
-        };
-        
-        if (ENABLE_THINKING_MODE) {
-          nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
-        }
-        
-        // Add delay between chunks to avoid rate limiting
-        if (i > 0) {
-          const chunkDelay = 2000 + (i * 1000); // Progressive delay
-          console.log(`⏳ Waiting ${chunkDelay}ms before next chunk...`);
-          await sleep(chunkDelay);
-        }
-        
-        // Use token bucket for rate limiting
-        await requestBucket.consume(1);
-        
-        const response = await limiter(async () => {
-          return await callWithRetry(
-            () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-              headers: {
-                'Authorization': `Bearer ${NIM_API_KEY}`,
-                'Content-Type': 'application/json'
-              },
-              timeout: 120000
-            }),
-            `Chunk ${i + 1}/${chunks.length} - Model: ${nimModel}`
-          );
-        });
-        
-        chunkResponses.push(response.data);
-        console.log(`✅ Chunk ${i + 1}/${chunks.length} completed`);
+      console.log(`🔄 Large request detected (${estimatedTokens} tokens). Smart truncation...`);
+      const truncatedMessages = smartChunkConversation(messages);
+      if (truncatedMessages) {
+        processedMessages = truncatedMessages;
+        console.log(`📦 Reduced to ${estimateTokens(JSON.stringify(processedMessages))} tokens`);
       }
-      
-      // Combine responses
-      const combinedResponse = combineChunkedResponses(chunkResponses);
-      
-      // Transform to OpenAI format
-      const openaiResponse = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: combinedResponse.choices.map(choice => {
-          let fullContent = choice.message?.content || '';
-          
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
-          }
-          
-          return {
-            index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
-            finish_reason: choice.finish_reason
-          };
-        }),
-        usage: combinedResponse.usage
-      };
-      
-      console.log(`✅ Chunked request completed: ${combinedResponse.usage.total_tokens} total tokens`);
-      return res.json(openaiResponse);
     }
     
-    // For streaming or smaller requests, process normally
+    // Prepare the request
     const nimRequest = {
       model: nimModel,
-      messages: messages,
+      messages: processedMessages,
       temperature: temperature || 0.6,
-      max_tokens: max_tokens || 9024,
+      max_tokens: max_tokens || 4096, // Reduced from 9024 to be safer
       stream: stream || false
     };
     
@@ -424,6 +313,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       let buffer = '';
       let reasoningStarted = false;
+      let isFirstContent = true;
       
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
@@ -442,6 +332,17 @@ app.post('/v1/chat/completions', async (req, res) => {
               if (data.choices?.[0]?.delta) {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
+                
+                // FIX: Ensure we're not repeating user's messages in the response
+                if (content && isFirstContent) {
+                  isFirstContent = false;
+                  // Check if the model is trying to continue the conversation instead of responding
+                  if (content.startsWith('Human:') || content.startsWith('User:') || 
+                      content.includes(messages[messages.length - 1]?.content?.substring(0, 20))) {
+                    console.warn('⚠️ Detected model trying to complete user message, filtering...');
+                    return; // Skip this chunk
+                  }
+                }
                 
                 if (SHOW_REASONING) {
                   let combinedContent = '';
@@ -490,28 +391,36 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      // Transform NIM response to OpenAI format with reasoning
+      // Transform NIM response to OpenAI format
+      let responseContent = response.data.choices[0]?.message?.content || '';
+      
+      // FIX: Additional check to ensure model isn't completing the conversation
+      const lastUserMessage = messages[messages.length - 1]?.content || '';
+      if (responseContent.includes(lastUserMessage.substring(0, 50))) {
+        console.warn('⚠️ Response contains user message, cleaning up...');
+        // Try to extract just the assistant's part
+        const assistantParts = responseContent.split(/\n(?=(?:Assistant|AI|Bot): )/);
+        if (assistantParts.length > 1) {
+          responseContent = assistantParts[assistantParts.length - 1];
+        }
+      }
+      
+      // Remove any "Human:" or "User:" prefixes the model might generate
+      responseContent = responseContent.replace(/^(?:Human|User|Assistant|AI|Bot):\s*/gm, '');
+      
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: model,
-        choices: response.data.choices.map(choice => {
-          let fullContent = choice.message?.content || '';
-          
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
-          }
-          
-          return {
-            index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
-            finish_reason: choice.finish_reason
-          };
-        }),
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: responseContent
+          },
+          finish_reason: response.data.choices[0]?.finish_reason || 'stop'
+        }],
         usage: response.data.usage || {
           prompt_tokens: 0,
           completion_tokens: 0,
@@ -519,7 +428,14 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       };
       
-      // Log token usage for monitoring
+      // Handle reasoning content if enabled
+      if (SHOW_REASONING && response.data.choices[0]?.message?.reasoning_content) {
+        const reasoning = response.data.choices[0].message.reasoning_content;
+        openaiResponse.choices[0].message.content = 
+          '<think>\n' + reasoning + '\n</think>\n\n' + responseContent;
+      }
+      
+      // Log token usage
       if (response.data.usage) {
         const totalTokens = response.data.usage.total_tokens || 0;
         console.log(`📊 Total tokens used: ${totalTokens} (Prompt: ${response.data.usage.prompt_tokens || 0}, Completion: ${response.data.usage.completion_tokens || 0})`);
@@ -531,7 +447,6 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (error) {
     console.error('❌ Proxy error:', error.message);
     
-    // Enhanced error logging for debugging
     if (error.response) {
       console.error(`   Status: ${error.response.status}`);
       console.error(`   Headers:`, JSON.stringify(error.response.headers, null, 2));
@@ -540,12 +455,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       console.error(`   No response received:`, error.code);
     }
     
-    // Better error response with Retry-After hint for 429 errors
     const status = error.response?.status || 500;
     const retryAfter = error.response?.headers?.['retry-after'];
     
     if (status === 429) {
-      // Empty token bucket after 429 to prevent cascade
       requestBucket.tokens = 0;
       res.setHeader('Retry-After', retryAfter || '30');
     }
@@ -578,9 +491,10 @@ app.listen(PORT, () => {
   console.log(`📊 Rate limiting: Token bucket (30 req/min, refill 1/sec)`);
   console.log(`🔄 Concurrent requests: 2 max`);
   console.log(`🔄 Retry config: ${RETRY_CONFIG.maxRetries + 1} attempts with exponential backoff`);
-  console.log(`📦 Request chunking: Enabled for requests > ${MAX_TOKENS_PER_REQUEST} tokens`);
+  console.log(`📦 Smart truncation: Enabled for requests > ${MAX_TOKENS_PER_REQUEST} tokens`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
   console.log(`🔍 Health check: http://localhost:${PORT}/health`);
   console.log(`💭 Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`🧠 Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`🛡️ Anti-completion protection: Enabled`);
 });
