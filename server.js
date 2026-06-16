@@ -2,13 +2,66 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const pLimit = require('p-limit'); // Add this package: npm install p-limit
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Rate limiting setup
+const limiter = pLimit(3); // Limit to 3 concurrent requests to NVIDIA API
+
+// Retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 3,
+  initialDelay: 1000, // 1 second
+  maxDelay: 30000, // 30 seconds
+  backoffFactor: 2
+};
+
+// Helper: sleep function
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper: call with retry for 429 errors
+async function callWithRetry(fn, context = '') {
+  let lastError;
+  let delay = RETRY_CONFIG.initialDelay;
+  
+  for (let attempt = 1; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      
+      // Only retry on 429, 503, 504
+      const isRetryable = error.response?.status === 429 || 
+                          error.response?.status === 503 || 
+                          error.response?.status === 504 ||
+                          error.code === 'ECONNRESET';
+      
+      if (!isRetryable || attempt === RETRY_CONFIG.maxRetries) {
+        throw error;
+      }
+      
+      // Check for Retry-After header
+      let retryAfter = error.response?.headers?.['retry-after'];
+      let waitTime = retryAfter ? parseInt(retryAfter) * 1000 : delay;
+      waitTime = Math.min(waitTime, RETRY_CONFIG.maxDelay);
+      
+      console.log(`⚠️ ${context} Rate limited (attempt ${attempt}/${RETRY_CONFIG.maxRetries}), waiting ${waitTime}ms...`);
+      await sleep(waitTime);
+      delay = Math.min(delay * RETRY_CONFIG.backoffFactor, RETRY_CONFIG.maxDelay);
+    }
+  }
+  throw lastError;
+}
+
+// Model cache to avoid repeated lookups
+const modelCache = new Map();
+
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '100mb' })); app.use(express.urlencoded({ limit: '100mb', extended: true }));
+app.use(express.json({ limit: '100mb' })); 
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
@@ -30,6 +83,36 @@ const MODEL_MAPPING = {
   'claude-3-sonnet': 'mistralai/mistral-medium-3.5-128b',
   'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b' 
 };
+
+// Helper function to resolve model without making test requests
+async function resolveModel(openaiModel) {
+  // Check cache first
+  if (modelCache.has(openaiModel)) {
+    return modelCache.get(openaiModel);
+  }
+  
+  // Check mapping
+  if (MODEL_MAPPING[openaiModel]) {
+    modelCache.set(openaiModel, MODEL_MAPPING[openaiModel]);
+    return MODEL_MAPPING[openaiModel];
+  }
+  
+  // Use fallback based on model name patterns (without making API calls)
+  const modelLower = openaiModel.toLowerCase();
+  let fallbackModel;
+  
+  if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
+    fallbackModel = 'meta/llama-3.1-405b-instruct';
+  } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
+    fallbackModel = 'meta/llama-3.1-70b-instruct';
+  } else {
+    fallbackModel = 'meta/llama-3.1-8b-instruct';
+  }
+  
+  console.warn(`⚠️ Unknown model "${openaiModel}", using fallback: ${fallbackModel}`);
+  modelCache.set(openaiModel, fallbackModel);
+  return fallbackModel;
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -61,35 +144,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Smart model selection with fallback
-    let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
-      try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        }, {
-          headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) {
-            nimModel = model;
-          }
-        });
-      } catch (e) {}
-      
-      if (!nimModel) {
-        const modelLower = model.toLowerCase();
-        if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-          nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-          nimModel = 'meta/llama-3.1-70b-instruct';
-        } else {
-          nimModel = 'meta/llama-3.1-8b-instruct';
-        }
-      }
-    }
+    // Get client IP for logging (optional)
+    const clientIp = req.ip || req.connection.remoteAddress;
+    
+    // Smart model selection with fallback (NO test request)
+    const nimModel = await resolveModel(model);
     
     // Transform OpenAI request to NIM format
     const nimRequest = {
@@ -97,17 +156,27 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages: messages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 9024,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
     
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json'
+    // Add thinking mode if enabled
+    if (ENABLE_THINKING_MODE) {
+      nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
+    }
+    
+    // Make request to NVIDIA NIM API with concurrency limiting and retry logic
+    const response = await limiter(async () => {
+      return await callWithRetry(
+        () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+          headers: {
+            'Authorization': `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: stream ? 'stream' : 'json',
+          timeout: 120000 // 2 minute timeout
+        }),
+        `Model: ${nimModel}, IP: ${clientIp}`
+      );
     });
     
     if (stream) {
@@ -121,13 +190,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
-        const lines = buffer.split('\\n');
+        const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         
         lines.forEach(line => {
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
-              res.write(line + '\\n');
+              res.write(line + '\n');
               return;
             }
             
@@ -141,14 +210,14 @@ app.post('/v1/chat/completions', async (req, res) => {
                   let combinedContent = '';
                   
                   if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\\n' + reasoning;
+                    combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
                   } else if (reasoning) {
                     combinedContent = reasoning;
                   }
                   
                   if (content && reasoningStarted) {
-                    combinedContent += '</think>\\n\\n' + content;
+                    combinedContent += '</think>\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
@@ -167,9 +236,9 @@ app.post('/v1/chat/completions', async (req, res) => {
                   delete data.choices[0].delta.reasoning_content;
                 }
               }
-              res.write(`data: ${JSON.stringify(data)}\\n\\n`);
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              res.write(line + '\\n');
+              res.write(line + '\n');
             }
           }
         });
@@ -191,7 +260,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           let fullContent = choice.message?.content || '';
           
           if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\\n' + choice.message.reasoning_content + '\\n</think>\\n\\n' + fullContent;
+            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
           }
           
           return {
@@ -216,11 +285,22 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (error) {
     console.error('Proxy error:', error.message);
     
-    res.status(error.response?.status || 500).json({
+    // Better error response with Retry-After hint for 429 errors
+    const status = error.response?.status || 500;
+    const retryAfter = error.response?.headers?.['retry-after'];
+    
+    if (status === 429) {
+      res.setHeader('Retry-After', retryAfter || '5');
+    }
+    
+    res.status(status).json({
       error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
+        message: status === 429 
+          ? 'Rate limit exceeded. Please wait before sending more requests.'
+          : error.message || 'Internal server error',
+        type: status === 429 ? 'rate_limit_error' : 'invalid_request_error',
+        code: status,
+        retry_after: retryAfter ? parseInt(retryAfter) : null
       }
     });
   }
