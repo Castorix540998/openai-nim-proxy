@@ -34,14 +34,13 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // CORRECTED: Token-based throttling to avoid invisible resource limits
 async function throttleTokens(tokensToUse) {
   const now = Date.now();
-  const timeSinceReset = now - TOKEN_CONFIG.lastTokenResetTime;
+  let timeSinceReset = now - TOKEN_CONFIG.lastTokenResetTime; // Changed to let
   
   // Reset counter every second
   if (timeSinceReset >= 1000) {
     TOKEN_CONFIG.tokensUsedInLastSecond = 0;
     TOKEN_CONFIG.lastTokenResetTime = now;
-    // Reset the timeSinceReset to 0 after reset
-    timeSinceReset = 0;
+    timeSinceReset = 0; // Now this works with let
   }
   
   // Check if we would exceed the limit
