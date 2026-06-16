@@ -18,12 +18,66 @@ const RETRY_CONFIG = {
   backoffFactor: 2      // Double the wait time each retry
 };
 
+// ===== TOKEN-BASED THROTTLING CONFIGURATION =====
+// This helps avoid invisible resource limits on NVIDIA's free tier
+const TOKEN_CONFIG = {
+  maxTokensPerSecond: 80,     // Start with 80 tokens/sec, adjust based on your observations
+  tokensUsedInLastSecond: 0,
+  lastTokenResetTime: Date.now()
+};
+
+// ===== HELPER FUNCTIONS =====
+
+// Sleep function
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Token-based throttling to avoid invisible resource limits
+async function throttleTokens(tokensToUse) {
+  const now = Date.now();
+  const timeSinceReset = now - TOKEN_CONFIG.lastTokenResetTime;
+  
+  // Reset counter every second
+  if (timeSinceReset >= 1000) {
+    TOKEN_CONFIG.tokensUsedInLastSecond = 0;
+    TOKEN_CONFIG.lastTokenResetTime = now;
+  }
+  
+  // Check if we would exceed the limit
+  if (TOKEN_CONFIG.tokensUsedInLastSecond + tokensToUse > TOKEN_CONFIG.maxTokensPerSecond) {
+    const waitTime = 1000 - timeSinceReset + 50; // Wait until next second + 50ms buffer
+    console.log(`⏳ Token throttling: ${tokensToUse} tokens would exceed ${TOKEN_CONFIG.maxTokensPerSecond}/s. Waiting ${waitTime}ms...`);
+    await sleep(waitTime);
+    // Reset after waiting
+    TOKEN_CONFIG.tokensUsedInLastSecond = 0;
+    TOKEN_CONFIG.lastTokenResetTime = Date.now();
+  }
+  
+  TOKEN_CONFIG.tokensUsedInLastSecond += tokensToUse;
+}
+
+// Helper: Roughly estimate token count (approximation for throttling)
+function estimateTokens(text) {
+  if (!text) return 0;
+  // Conservative estimate: ~4 characters per token for English
+  const length = typeof text === 'string' ? text.length : JSON.stringify(text).length;
+  return Math.ceil(length / 4) + 10;
+}
+
+// Helper: Estimate tokens in messages
+function estimateMessagesTokens(messages) {
+  let total = 0;
+  if (!messages || !Array.isArray(messages)) return 50;
+  for (const msg of messages) {
+    total += estimateTokens(msg.content || '');
+    total += estimateTokens(msg.role || '');
+    if (msg.name) total += estimateTokens(msg.name);
+  }
+  return total + 20; // Overhead for conversation structure
+}
+
 // Request throttling - enforce minimum time between requests
 let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL = 3000; // 3 seconds between requests
-
-// Helper: sleep function
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Helper: throttle requests to avoid rate limits
 async function throttleRequest() {
@@ -31,7 +85,7 @@ async function throttleRequest() {
   const timeSinceLastRequest = now - lastRequestTime;
   if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
     const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
-    console.log(`⏳ Throttling: Waiting ${waitTime}ms before next request...`);
+    console.log(`⏳ Request throttling: Waiting ${waitTime}ms before next request...`);
     await sleep(waitTime);
   }
   lastRequestTime = Date.now();
@@ -183,6 +237,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Throttle requests to avoid rate limits
     await throttleRequest();
     
+    // Estimate token usage and throttle based on tokens
+    const estimatedInputTokens = estimateMessagesTokens(messages);
+    console.log(`📊 Estimated input tokens: ${estimatedInputTokens}`);
+    await throttleTokens(estimatedInputTokens + 100); // Add 100 for response buffer
+    
     // Make request to NVIDIA NIM API with concurrency limiting and retry logic
     const response = await limiter(async () => {
       return await callWithRetry(
@@ -298,6 +357,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       };
       
+      // Log token usage for monitoring
+      if (response.data.usage) {
+        const totalTokens = response.data.usage.total_tokens || 0;
+        console.log(`📊 Total tokens used: ${totalTokens} (Prompt: ${response.data.usage.prompt_tokens || 0}, Completion: ${response.data.usage.completion_tokens || 0})`);
+      }
+      
       res.json(openaiResponse);
     }
     
@@ -343,4 +408,5 @@ app.listen(PORT, () => {
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Rate limiting: 1 concurrent request, ${MIN_REQUEST_INTERVAL}ms between requests`);
   console.log(`Retry config: ${RETRY_CONFIG.maxRetries} retries, starting at ${RETRY_CONFIG.initialDelay}ms`);
+  console.log(`Token throttling: ${TOKEN_CONFIG.maxTokensPerSecond} tokens/second`);
 });
