@@ -1,4 +1,4 @@
-// server.js - Smart Context Proxy with Triton Queue Management
+// server.js - Narrative-Aware Context Proxy with Triton Queue Management
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -7,55 +7,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ===== NVIDIA TRITON QUEUE CONFIGURATION =====
-// This tells NIM to accept more requests in queue instead of returning 429
 process.env.NIM_TRITON_MAX_QUEUE_SIZE = process.env.NIM_TRITON_MAX_QUEUE_SIZE || '100';
 process.env.NIM_TRITON_MAX_BATCH_SIZE = process.env.NIM_TRITON_MAX_BATCH_SIZE || '8';
 
-// ===== SMART CONTEXT CONFIGURATION =====
-const MAX_TOKENS = 2500;           // Target token limit
+// ===== CONTEXT CONFIGURATION =====
+const MAX_TOKENS = 2500;
 const MAX_RESPONSE_TOKENS = 2048;
-const MIN_DELAY = 8000;           // 8 seconds between requests
+const MIN_DELAY = 8000;
 const MAX_RETRIES = 4;
-const RETRY_BASE_DELAY = 5000;    // 5 second base for retry backoff
+const RETRY_BASE_DELAY = 5000;
 
-const IMPORTANCE_KEYWORDS = [      // Words that signal important context
-  'name', 'remember', 'important', 'secret', 'promise',
-  'backstory', 'character', 'personality', 'always', 'never',
-  'love', 'hate', 'family', 'power', 'ability', 'rule',
-  'remember that', 'don\'t forget', 'key', 'crucial', 'essential'
-];
-
-// ===== SMART CONTEXT MANAGER =====
-class SmartContextManager {
-  
-  // Score messages by importance
-  scoreImportance(message) {
-    let score = 0;
-    const content = (message.content || '').toLowerCase();
-    
-    // Recent messages are more important
-    score += 10;
-    
-    // System messages are very important
-    if (message.role === 'system') score += 50;
-    
-    // Messages with key details
-    IMPORTANCE_KEYWORDS.forEach(keyword => {
-      if (content.includes(keyword)) score += 15;
-    });
-    
-    // Longer messages might contain more context
-    if (content.length > 200) score += 10;
-    if (content.length > 500) score += 5;
-    
-    // Messages with quotes or specific details
-    if (content.includes('"') || content.includes("'")) score += 5;
-    
-    // Messages that seem to establish rules or facts
-    if (content.match(/(is|are|was|were|will be|always|never) (a|the|an)/)) score += 10;
-    
-    return score;
-  }
+// ===== NARRATIVE-AWARE CONTEXT MANAGER =====
+class NarrativeContextManager {
   
   prepareContext(messages) {
     const totalTokens = estimateTokens(JSON.stringify(messages));
@@ -65,67 +28,112 @@ class SmartContextManager {
       return messages;
     }
     
-    console.log(`🧠 Smart compression: ${totalTokens} → ${MAX_TOKENS} tokens`);
+    console.log(`📖 Preserving narrative flow: ${totalTokens} → ${MAX_TOKENS} tokens`);
     
-    // Separate system messages (keep all)
     const systemMessages = messages.filter(m => m.role === 'system');
     const conversationMessages = messages.filter(m => m.role !== 'system');
     
-    // Score and sort conversation messages by importance
-    const scoredMessages = conversationMessages.map((msg, index) => ({
-      ...msg,
-      _score: this.scoreImportance(msg),
-      _index: index // Keep original order reference
-    }));
+    // CRITICAL: Keep messages in CHRONOLOGICAL ORDER
+    // Never sort by importance - that breaks the story flow
     
-    // Always keep the last 3 messages (immediate context)
-    const lastThree = scoredMessages.slice(-3);
-    const olderMessages = scoredMessages.slice(0, -3);
+    // Find complete exchanges (user-assistant pairs)
+    const exchanges = [];
+    let currentExchange = [];
     
-    // Sort older messages by importance score
-    const importantOlder = olderMessages
-      .sort((a, b) => b._score - a._score)
-      .filter(msg => msg._score > 20); // Only keep moderately important ones
-    
-    // Combine: system + important older + recent
-    let selectedMessages = [
-      ...systemMessages,
-      ...importantOlder.sort((a, b) => a._index - b._index), // Restore chronological order
-      ...lastThree
-    ];
-    
-    // Remove scoring metadata
-    selectedMessages = selectedMessages.map(({ _score, _index, ...msg }) => msg);
-    
-    // If still too large, progressively trim older messages
-    while (estimateTokens(JSON.stringify(selectedMessages)) > MAX_TOKENS) {
-      const nonSystemNonRecent = selectedMessages.filter(
-        m => m.role !== 'system' && !lastThree.includes(m)
-      );
-      
-      if (nonSystemNonRecent.length === 0) {
-        // Emergency: truncate content of recent messages
-        selectedMessages = selectedMessages.map(msg => ({
-          ...msg,
-          content: msg.content.substring(0, Math.floor(msg.content.length * 0.7))
-        }));
-      } else {
-        // Remove least important older message
-        const leastImportant = nonSystemNonRecent.reduce((min, msg) => 
-          (this.scoreImportance(msg) < this.scoreImportance(min)) ? msg : min
-        );
-        selectedMessages = selectedMessages.filter(m => m !== leastImportant);
+    for (const msg of conversationMessages) {
+      currentExchange.push(msg);
+      if (msg.role === 'assistant') {
+        exchanges.push([...currentExchange]);
+        currentExchange = [];
       }
     }
     
+    // If there's an incomplete exchange (last message is from user), add it
+    if (currentExchange.length > 0) {
+      exchanges.push([...currentExchange]);
+    }
+    
+    // Strategy: Keep ALL system messages + last N complete exchanges
+    const systemTokens = estimateTokens(JSON.stringify(systemMessages));
+    let availableTokens = MAX_TOKENS - systemTokens - 100; // Reserve 100 for safety
+    let selectedExchanges = [];
+    let usedTokens = 0;
+    
+    // Always include the LAST exchange (current conversation)
+    if (exchanges.length > 0) {
+      const lastExchange = exchanges[exchanges.length - 1];
+      const lastTokens = estimateTokens(JSON.stringify(lastExchange));
+      selectedExchanges.unshift(lastExchange);
+      usedTokens += lastTokens;
+      availableTokens -= lastTokens;
+    }
+    
+    // Work backwards, keeping complete exchanges until we run out of tokens
+    for (let i = exchanges.length - 2; i >= 0; i--) {
+      const exchange = exchanges[i];
+      const exchangeTokens = estimateTokens(JSON.stringify(exchange));
+      
+      if (usedTokens + exchangeTokens <= availableTokens) {
+        selectedExchanges.unshift(exchange); // Add to front to maintain order
+        usedTokens += exchangeTokens;
+      } else {
+        // Try to include a condensed version of this exchange
+        const condensedExchange = exchange.map(msg => ({
+          role: msg.role,
+          content: this.condenseMessage(msg)
+        }));
+        const condensedTokens = estimateTokens(JSON.stringify(condensedExchange));
+        
+        if (usedTokens + condensedTokens <= availableTokens) {
+          selectedExchanges.unshift(condensedExchange);
+          usedTokens += condensedTokens;
+        } else {
+          // Can't fit this exchange at all, stop here
+          break;
+        }
+      }
+    }
+    
+    // Flatten exchanges back into message array
+    let selectedMessages = [
+      ...systemMessages,
+      ...selectedExchanges.flat()
+    ];
+    
+    // Add a narrative continuity marker if we had to cut context
+    if (exchanges.length > selectedExchanges.length) {
+      const removedCount = exchanges.length - selectedExchanges.length;
+      selectedMessages.splice(systemMessages.length, 0, {
+        role: 'system',
+        content: `[Continuing the ongoing story. Previous ${removedCount} exchanges happened earlier. Maintain story continuity naturally.]`
+      });
+    }
+    
+    // Add a final instruction to keep the model in "story mode"
+    selectedMessages.push({
+      role: 'system',
+      content: '[Continue the story naturally from the last exchange. Do not summarize or describe characters unless asked. Stay in character and advance the plot.]'
+    });
+    
     const finalTokens = estimateTokens(JSON.stringify(selectedMessages));
-    console.log(`✅ Preserved ${selectedMessages.length} messages (${finalTokens} tokens)`);
+    console.log(`✅ Kept ${selectedExchanges.length}/${exchanges.length} exchanges (${finalTokens} tokens)`);
     
     return selectedMessages;
   }
+  
+  condenseMessage(msg) {
+    // Keep the essence of the message without full detail
+    const content = msg.content || '';
+    if (content.length <= 300) return content;
+    
+    // Keep first and last parts of long messages
+    const first = content.substring(0, 150);
+    const last = content.substring(content.length - 150);
+    return `${first}... [continues] ...${last}`;
+  }
 }
 
-const contextManager = new SmartContextManager();
+const contextManager = new NarrativeContextManager();
 
 // ===== REQUEST QUEUE WITH TRITON SUPPORT =====
 class RequestQueue {
@@ -151,7 +159,6 @@ class RequestQueue {
       const { fn, resolve, reject } = this.queue.shift();
       
       try {
-        // Wait rate limit delay between requests
         const now = Date.now();
         const timeSinceLastRequest = now - this.lastRequestTime;
         
@@ -199,7 +206,6 @@ async function callWithRetry(fn, context = '') {
         throw error;
       }
       
-      // Check for Retry-After header (Triton provides this)
       let waitTime;
       const retryAfter = error.response?.headers?.['retry-after'];
       
@@ -207,7 +213,6 @@ async function callWithRetry(fn, context = '') {
         waitTime = parseInt(retryAfter) * 1000;
         console.log(`⚠️ Triton Retry-After: ${retryAfter}s`);
       } else {
-        // Exponential backoff with jitter
         waitTime = RETRY_BASE_DELAY * Math.pow(2, attempt);
         waitTime = waitTime * (0.8 + Math.random() * 0.4);
       }
@@ -247,17 +252,15 @@ function resolveModel(model) {
   return 'meta/llama-3.1-8b-instruct';
 }
 
-// Health check with Triton info
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    strategy: 'smart_importance_scoring',
+    strategy: 'narrative_exchange_preservation',
     max_tokens: MAX_TOKENS,
     min_delay: `${MIN_DELAY/1000}s`,
     triton_queue_size: process.env.NIM_TRITON_MAX_QUEUE_SIZE,
-    triton_batch_size: process.env.NIM_TRITON_MAX_BATCH_SIZE,
-    queue_length: requestQueue.queue.length,
-    max_retries: MAX_RETRIES
+    queue_length: requestQueue.queue.length
   });
 });
 
@@ -293,7 +296,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
     }
     
-    // Use queue + retry with Triton support
     const response = await requestQueue.add(() =>
       callWithRetry(
         () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
@@ -302,7 +304,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             'Content-Type': 'application/json'
           },
           responseType: stream ? 'stream' : 'json',
-          timeout: 120000 // 2 minute timeout for queued requests
+          timeout: 120000
         }),
         nimModel
       )
@@ -315,7 +317,32 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       
-      response.data.on('data', (chunk) => res.write(chunk));
+      let buffer = '';
+      let isFirstChunk = true;
+      
+      response.data.on('data', (chunk) => {
+        if (isFirstChunk) {
+          // Check if model is trying to summarize instead of continue
+          const chunkStr = chunk.toString();
+          if (chunkStr.includes('character') && chunkStr.includes('description') ||
+              chunkStr.includes('summary') || chunkStr.includes('recap')) {
+            console.warn('⚠️ Detected summary mode, attempting to redirect...');
+            // Don't filter, just warn - the narrative markers should help
+          }
+          isFirstChunk = false;
+        }
+        
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        lines.forEach(line => {
+          if (line.startsWith('data: ')) {
+            res.write(line + '\n');
+          }
+        });
+      });
+      
       response.data.on('end', () => res.end());
       response.data.on('error', (err) => {
         console.error('Stream error:', err.message);
@@ -324,7 +351,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     } else {
       let content = response.data.choices[0]?.message?.content || '';
       
-      // Clean up any conversation completion artifacts
+      // Clean up any summary artifacts
+      content = content.replace(/^(?:Here is a |Let me |I'll ).*?(?:summary|description|recap).*?:?\s*/i, '');
       content = content.replace(/^(?:Human|User|Assistant|AI|Bot):\s*/gm, '');
       
       res.json({
@@ -373,14 +401,10 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Smart Context Proxy with Triton Support`);
+  console.log(`🚀 Narrative-Aware Proxy with Triton Support`);
   console.log(`📡 Port: ${PORT}`);
-  console.log(`🧠 Strategy: Importance-based context preservation`);
+  console.log(`📖 Strategy: Complete exchange preservation (chronological)`);
   console.log(`📦 Max tokens: ${MAX_TOKENS}`);
-  console.log(`📝 Max response: ${MAX_RESPONSE_TOKENS} tokens`);
   console.log(`⏱️ Rate: 1 request per ${MIN_DELAY/1000}s`);
   console.log(`📋 Triton queue: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
-  console.log(`📊 Triton batch: ${process.env.NIM_TRITON_MAX_BATCH_SIZE}`);
-  console.log(`🔄 Max retries: ${MAX_RETRIES}`);
-  console.log(`🔑 API Base: ${NIM_API_BASE}`);
 });
