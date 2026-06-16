@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (Improved Rate Limiting & Chunking)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -7,123 +7,196 @@ const pLimit = require('p-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Rate limiting setup - reduced to 1 concurrent request to minimize 429 errors
-const limiter = pLimit(1); // Process one request at a time
+// Rate limiting setup - DYNAMIC concurrent requests
+const limiter = pLimit(2); // Allow 2 concurrent requests initially
 
-// Retry configuration - more aggressive retry with longer waits
+// Retry configuration with exponential backoff
 const RETRY_CONFIG = {
-  maxRetries: 3,        // Reduced to 3 to avoid wasting time on huge requests
-  initialDelay: 5000,   // Wait 5 seconds before first retry
-  maxDelay: 30000,      // Wait up to 30 seconds
-  backoffFactor: 2      // Double the wait time each retry
+  maxRetries: 5,        // More retries with better backoff
+  initialDelay: 1000,   // Start with 1 second
+  maxDelay: 60000,      // Up to 60 seconds
+  backoffFactor: 2,     // Double each time
+  jitter: true          // Add randomness to prevent thundering herd
 };
 
-// ===== TOKEN-BASED THROTTLING CONFIGURATION =====
-// This helps avoid invisible resource limits on NVIDIA's free tier
-const TOKEN_CONFIG = {
-  maxTokensPerSecond: 50,     // Reduced to 50 tokens/sec for more conservative throttling
-  tokensUsedInLastSecond: 0,
-  lastTokenResetTime: Date.now()
-};
+// ===== TOKEN BUCKET FOR RATE LIMITING =====
+class TokenBucket {
+  constructor(capacity, refillRate, refillInterval = 1000) {
+    this.capacity = capacity;
+    this.tokens = capacity;
+    this.refillRate = refillRate;
+    this.refillInterval = refillInterval;
+    this.lastRefill = Date.now();
+  }
+
+  refill() {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    const refillAmount = Math.floor(elapsed / this.refillInterval) * this.refillRate;
+    this.tokens = Math.min(this.capacity, this.tokens + refillAmount);
+    this.lastRefill = now;
+  }
+
+  async consume(tokens = 1) {
+    this.refill();
+    
+    if (this.tokens >= tokens) {
+      this.tokens -= tokens;
+      return true;
+    }
+    
+    // Calculate wait time until tokens are available
+    const tokensNeeded = tokens - this.tokens;
+    const waitTime = Math.ceil((tokensNeeded / this.refillRate) * this.refillInterval);
+    
+    console.log(`⏳ Token bucket: Need ${tokensNeeded} more tokens. Waiting ${waitTime}ms...`);
+    await sleep(Math.min(waitTime, 10000)); // Max 10 second wait
+    this.refill();
+    this.tokens -= tokens;
+    return true;
+  }
+}
+
+// Create token bucket: 30 tokens max, refill 1 token per second (30 requests per minute)
+const requestBucket = new TokenBucket(30, 1, 1000);
+
+// ===== REQUEST CHUNKING CONFIGURATION =====
+const MAX_TOKENS_PER_REQUEST = 4000; // Maximum tokens per request to avoid 429 errors
 
 // ===== HELPER FUNCTIONS =====
 
 // Sleep function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// CORRECTED: Token-based throttling to avoid invisible resource limits
-async function throttleTokens(tokensToUse) {
-  const now = Date.now();
-  let timeSinceReset = now - TOKEN_CONFIG.lastTokenResetTime; // Changed to let
-  
-  // Reset counter every second
-  if (timeSinceReset >= 1000) {
-    TOKEN_CONFIG.tokensUsedInLastSecond = 0;
-    TOKEN_CONFIG.lastTokenResetTime = now;
-    timeSinceReset = 0; // Now this works with let
-  }
-  
-  // Check if we would exceed the limit
-  if (TOKEN_CONFIG.tokensUsedInLastSecond + tokensToUse > TOKEN_CONFIG.maxTokensPerSecond) {
-    // Calculate wait time - ensure it's always positive
-    let waitTime = 1000 - timeSinceReset;
-    if (waitTime < 100) waitTime = 100; // Minimum 100ms wait
-    waitTime = Math.min(waitTime, 5000); // Maximum 5 seconds wait
-    
-    console.log(`⏳ Token throttling: ${tokensToUse} tokens would exceed ${TOKEN_CONFIG.maxTokensPerSecond}/s. Waiting ${waitTime}ms...`);
-    await sleep(waitTime);
-    // Reset after waiting
-    TOKEN_CONFIG.tokensUsedInLastSecond = 0;
-    TOKEN_CONFIG.lastTokenResetTime = Date.now();
-  }
-  
-  TOKEN_CONFIG.tokensUsedInLastSecond += tokensToUse;
-}
-
-// Helper: Roughly estimate token count (approximation for throttling)
+// Helper: Better token estimation
 function estimateTokens(text) {
   if (!text) return 0;
-  const length = typeof text === 'string' ? text.length : JSON.stringify(text).length;
-  return Math.ceil(length / 4) + 10;
+  const str = typeof text === 'string' ? text : JSON.stringify(text);
+  // Better estimation: ~4 characters per token for English text
+  return Math.ceil(str.length / 4);
 }
 
-// Helper: Estimate tokens in messages
-function estimateMessagesTokens(messages) {
-  let total = 0;
-  if (!messages || !Array.isArray(messages)) return 50;
-  for (const msg of messages) {
-    total += estimateTokens(msg.content || '');
-    total += estimateTokens(msg.role || '');
-    if (msg.name) total += estimateTokens(msg.name);
+// Helper: Split long conversation into chunks
+function chunkMessages(messages, maxTokens = MAX_TOKENS_PER_REQUEST) {
+  if (!messages || messages.length === 0) return [messages];
+  
+  const chunks = [];
+  let currentChunk = [];
+  let currentTokens = 0;
+  
+  // Always keep system message in every chunk
+  const systemMessages = messages.filter(m => m.role === 'system');
+  const nonSystemMessages = messages.filter(m => m.role !== 'system');
+  
+  // Calculate system message tokens
+  const systemTokens = systemMessages.reduce((sum, msg) => 
+    sum + estimateTokens(msg.content), 0);
+  
+  // Start first chunk with system messages
+  currentChunk = [...systemMessages];
+  currentTokens = systemTokens;
+  
+  for (let i = 0; i < nonSystemMessages.length; i++) {
+    const msg = nonSystemMessages[i];
+    const msgTokens = estimateTokens(msg.content) + estimateTokens(msg.role);
+    
+    // If adding this message would exceed the limit
+    if (currentTokens + msgTokens > maxTokens && currentChunk.length > systemMessages.length) {
+      // Save current chunk
+      chunks.push([...currentChunk]);
+      
+      // Start new chunk with system messages + overlap for context
+      const overlapStart = Math.max(0, currentChunk.length - systemMessages.length - 3);
+      currentChunk = [
+        ...systemMessages,
+        ...currentChunk.slice(systemMessages.length + overlapStart)
+      ];
+      currentTokens = systemTokens + currentChunk
+        .slice(systemMessages.length)
+        .reduce((sum, m) => sum + estimateTokens(m.content), 0);
+    }
+    
+    currentChunk.push(msg);
+    currentTokens += msgTokens;
   }
-  return total + 20;
-}
-
-// Request throttling - enforce minimum time between requests
-let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 5000; // Increased to 5 seconds between requests
-
-// Helper: throttle requests to avoid rate limits
-async function throttleRequest() {
-  const now = Date.now();
-  const timeSinceLastRequest = now - lastRequestTime;
-  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-    const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
-    console.log(`⏳ Request throttling: Waiting ${waitTime}ms before next request...`);
-    await sleep(waitTime);
+  
+  // Add final chunk if not empty
+  if (currentChunk.length > systemMessages.length) {
+    chunks.push(currentChunk);
   }
-  lastRequestTime = Date.now();
+  
+  return chunks.length > 0 ? chunks : [messages];
 }
 
-// Helper: call with retry for 429 errors
+// Helper: Combine chunked responses
+function combineChunkedResponses(responses) {
+  if (responses.length === 1) return responses[0];
+  
+  // Combine all response content
+  const combinedContent = responses
+    .map(r => r.choices[0]?.message?.content || '')
+    .join('\n\n---\n\n');
+  
+  // Sum up token usage
+  const totalUsage = responses.reduce((sum, r) => ({
+    prompt_tokens: (sum.prompt_tokens || 0) + (r.usage?.prompt_tokens || 0),
+    completion_tokens: (sum.completion_tokens || 0) + (r.usage?.completion_tokens || 0),
+    total_tokens: (sum.total_tokens || 0) + (r.usage?.total_tokens || 0)
+  }), {});
+  
+  return {
+    ...responses[0],
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: combinedContent
+      },
+      finish_reason: responses[responses.length - 1].choices[0]?.finish_reason || 'stop'
+    }],
+    usage: totalUsage
+  };
+}
+
+// Helper: Call with smart retry logic
 async function callWithRetry(fn, context = '') {
   let lastError;
-  let delay = RETRY_CONFIG.initialDelay;
   
-  for (let attempt = 1; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+  for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
       lastError = error;
       
-      // Only retry on 429, 503, 504
+      // Check if error is retryable
       const isRetryable = error.response?.status === 429 || 
                           error.response?.status === 503 || 
                           error.response?.status === 504 ||
-                          error.code === 'ECONNRESET';
+                          error.code === 'ECONNRESET' ||
+                          error.code === 'ETIMEDOUT';
       
       if (!isRetryable || attempt === RETRY_CONFIG.maxRetries) {
         throw error;
       }
       
-      // Check for Retry-After header
+      // Get retry delay from header or calculate with jitter
       let retryAfter = error.response?.headers?.['retry-after'];
-      let waitTime = retryAfter ? parseInt(retryAfter) * 1000 : delay;
-      waitTime = Math.min(waitTime, RETRY_CONFIG.maxDelay);
+      let waitTime;
       
-      console.log(`⚠️ ${context} Rate limited (attempt ${attempt}/${RETRY_CONFIG.maxRetries}), waiting ${waitTime}ms...`);
+      if (retryAfter) {
+        waitTime = parseInt(retryAfter) * 1000;
+      } else {
+        // Exponential backoff with jitter
+        waitTime = RETRY_CONFIG.initialDelay * Math.pow(RETRY_CONFIG.backoffFactor, attempt);
+        if (RETRY_CONFIG.jitter) {
+          waitTime = waitTime * (0.5 + Math.random() * 0.5); // 50-100% of calculated time
+        }
+        waitTime = Math.min(waitTime, RETRY_CONFIG.maxDelay);
+      }
+      
+      console.log(`⚠️ ${context} Rate limited (attempt ${attempt + 1}/${RETRY_CONFIG.maxRetries + 1}), waiting ${Math.round(waitTime/1000)}s...`);
+      console.log(`   Error details: ${error.response?.status} - ${error.response?.data?.error?.message || error.message}`);
       await sleep(waitTime);
-      delay = Math.min(delay * RETRY_CONFIG.backoffFactor, RETRY_CONFIG.maxDelay);
     }
   }
   throw lastError;
@@ -192,9 +265,12 @@ async function resolveModel(openaiModel) {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+    service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
+    thinking_mode: ENABLE_THINKING_MODE,
+    bucket_tokens: requestBucket.tokens,
+    bucket_capacity: requestBucket.capacity,
+    max_tokens_per_request: MAX_TOKENS_PER_REQUEST
   });
 });
 
@@ -217,28 +293,100 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
-    
-    // Get client IP for logging (optional)
     const clientIp = req.ip || req.connection.remoteAddress;
     
-    // Smart model selection with fallback (NO test request)
+    // Smart model selection
     const nimModel = await resolveModel(model);
     
-    // Check for huge request - warn if too large
-    const estimatedInputTokens = estimateMessagesTokens(messages);
-    console.log(`📊 Estimated input tokens: ${estimatedInputTokens}`);
+    // Estimate total tokens
+    const estimatedTokens = estimateTokens(JSON.stringify(messages));
+    console.log(`📊 Estimated total tokens: ${estimatedTokens}`);
     
-    if (estimatedInputTokens > 2000) {
-      console.warn(`⚠️ Large request detected: ${estimatedInputTokens} tokens. This may trigger rate limits.`);
-      // For very large requests, add extra delay
-      if (estimatedInputTokens > 5000) {
-        const extraDelay = Math.min(10000, estimatedInputTokens * 2);
-        console.log(`⏳ Large request: Adding ${extraDelay}ms extra delay...`);
-        await sleep(extraDelay);
+    // If request is too large and not streaming, chunk it
+    if (estimatedTokens > MAX_TOKENS_PER_REQUEST && !stream) {
+      console.log(`🔄 Large request detected (${estimatedTokens} tokens). Splitting into chunks...`);
+      
+      const chunks = chunkMessages(messages);
+      console.log(`📦 Split into ${chunks.length} chunks`);
+      
+      const chunkResponses = [];
+      
+      // Process each chunk with delay between them
+      for (let i = 0; i < chunks.length; i++) {
+        console.log(`🔄 Processing chunk ${i + 1}/${chunks.length} (${estimateTokens(JSON.stringify(chunks[i]))} tokens)`);
+        
+        const nimRequest = {
+          model: nimModel,
+          messages: chunks[i],
+          temperature: temperature || 0.6,
+          max_tokens: max_tokens || 9024,
+          stream: false
+        };
+        
+        if (ENABLE_THINKING_MODE) {
+          nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
+        }
+        
+        // Add delay between chunks to avoid rate limiting
+        if (i > 0) {
+          const chunkDelay = 2000 + (i * 1000); // Progressive delay
+          console.log(`⏳ Waiting ${chunkDelay}ms before next chunk...`);
+          await sleep(chunkDelay);
+        }
+        
+        // Use token bucket for rate limiting
+        await requestBucket.consume(1);
+        
+        const response = await limiter(async () => {
+          return await callWithRetry(
+            () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+              headers: {
+                'Authorization': `Bearer ${NIM_API_KEY}`,
+                'Content-Type': 'application/json'
+              },
+              timeout: 120000
+            }),
+            `Chunk ${i + 1}/${chunks.length} - Model: ${nimModel}`
+          );
+        });
+        
+        chunkResponses.push(response.data);
+        console.log(`✅ Chunk ${i + 1}/${chunks.length} completed`);
       }
+      
+      // Combine responses
+      const combinedResponse = combineChunkedResponses(chunkResponses);
+      
+      // Transform to OpenAI format
+      const openaiResponse = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: combinedResponse.choices.map(choice => {
+          let fullContent = choice.message?.content || '';
+          
+          if (SHOW_REASONING && choice.message?.reasoning_content) {
+            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
+          }
+          
+          return {
+            index: choice.index,
+            message: {
+              role: choice.message.role,
+              content: fullContent
+            },
+            finish_reason: choice.finish_reason
+          };
+        }),
+        usage: combinedResponse.usage
+      };
+      
+      console.log(`✅ Chunked request completed: ${combinedResponse.usage.total_tokens} total tokens`);
+      return res.json(openaiResponse);
     }
     
-    // Transform OpenAI request to NIM format
+    // For streaming or smaller requests, process normally
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -247,22 +395,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Add thinking mode if enabled
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
     }
     
-    // Throttle requests to avoid rate limits
-    await throttleRequest();
+    // Use token bucket for rate limiting
+    await requestBucket.consume(1);
     
-    // Estimate token usage and throttle based on tokens (with reduced buffer for large requests)
-    let tokenBuffer = 100;
-    if (estimatedInputTokens > 5000) tokenBuffer = 50; // Smaller buffer for huge requests
-    if (estimatedInputTokens > 10000) tokenBuffer = 20;
-    
-    await throttleTokens(estimatedInputTokens + tokenBuffer);
-    
-    // Make request to NVIDIA NIM API with concurrency limiting and retry logic
     const response = await limiter(async () => {
       return await callWithRetry(
         () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
@@ -271,14 +410,14 @@ app.post('/v1/chat/completions', async (req, res) => {
             'Content-Type': 'application/json'
           },
           responseType: stream ? 'stream' : 'json',
-          timeout: 120000 // 2 minute timeout
+          timeout: 120000
         }),
-        `Model: ${nimModel}, IP: ${clientIp}`
+        `Model: ${nimModel}`
       );
     });
     
     if (stream) {
-      // Handle streaming response with reasoning
+      // Handle streaming response
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -345,6 +484,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       response.data.on('end', () => res.end());
       response.data.on('error', (err) => {
         console.error('Stream error:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Stream error' });
+        }
         res.end();
       });
     } else {
@@ -387,24 +529,34 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    console.error('❌ Proxy error:', error.message);
+    
+    // Enhanced error logging for debugging
+    if (error.response) {
+      console.error(`   Status: ${error.response.status}`);
+      console.error(`   Headers:`, JSON.stringify(error.response.headers, null, 2));
+      console.error(`   Data:`, JSON.stringify(error.response.data, null, 2));
+    } else if (error.request) {
+      console.error(`   No response received:`, error.code);
+    }
     
     // Better error response with Retry-After hint for 429 errors
     const status = error.response?.status || 500;
     const retryAfter = error.response?.headers?.['retry-after'];
     
     if (status === 429) {
+      // Empty token bucket after 429 to prevent cascade
+      requestBucket.tokens = 0;
       res.setHeader('Retry-After', retryAfter || '30');
     }
     
     res.status(status).json({
       error: {
-        message: status === 429 
-          ? 'Rate limit exceeded. Your request is too large or too frequent. Please wait and try again.'
-          : error.message || 'Internal server error',
-        type: status === 429 ? 'rate_limit_error' : 'invalid_request_error',
+        message: error.response?.data?.error?.message || error.message || 'Internal server error',
+        type: status === 429 ? 'rate_limit_error' : 
+              status === 401 ? 'authentication_error' : 'invalid_request_error',
         code: status,
-        retry_after: retryAfter ? parseInt(retryAfter) : 30
+        retry_after: retryAfter ? parseInt(retryAfter) : null
       }
     });
   }
@@ -422,11 +574,13 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Rate limiting: 1 concurrent request, ${MIN_REQUEST_INTERVAL}ms between requests`);
-  console.log(`Retry config: ${RETRY_CONFIG.maxRetries} retries, starting at ${RETRY_CONFIG.initialDelay}ms`);
-  console.log(`Token throttling: ${TOKEN_CONFIG.maxTokensPerSecond} tokens/second`);
+  console.log(`🚀 OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
+  console.log(`📊 Rate limiting: Token bucket (30 req/min, refill 1/sec)`);
+  console.log(`🔄 Concurrent requests: 2 max`);
+  console.log(`🔄 Retry config: ${RETRY_CONFIG.maxRetries + 1} attempts with exponential backoff`);
+  console.log(`📦 Request chunking: Enabled for requests > ${MAX_TOKENS_PER_REQUEST} tokens`);
+  console.log(`🔑 API Base: ${NIM_API_BASE}`);
+  console.log(`🔍 Health check: http://localhost:${PORT}/health`);
+  console.log(`💭 Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`🧠 Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
 });
