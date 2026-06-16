@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy (Fixed Context & Chunking)
+// server.js - OpenAI to NVIDIA NIM API Proxy (Full Context Preservation)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -7,10 +7,10 @@ const pLimit = require('p-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Rate limiting setup - DYNAMIC concurrent requests
-const limiter = pLimit(2); // Allow 2 concurrent requests initially
+// Rate limiting setup
+const limiter = pLimit(2);
 
-// Retry configuration with exponential backoff
+// Retry configuration
 const RETRY_CONFIG = {
   maxRetries: 5,
   initialDelay: 1000,
@@ -58,78 +58,172 @@ class TokenBucket {
 
 const requestBucket = new TokenBucket(30, 1, 1000);
 
-// ===== IMPROVED REQUEST CHUNKING CONFIGURATION =====
+// ===== CONTEXT MANAGEMENT CONFIGURATION =====
 const MAX_TOKENS_PER_REQUEST = 4000;
+const SUMMARY_TRIGGER_TOKENS = 3000; // Start summarizing when we hit this threshold
+const SUMMARY_RESERVE_TOKENS = 1000; // Reserve tokens for the summary itself
+
+// ===== CONTEXT SUMMARIZATION SYSTEM =====
+class ConversationSummarizer {
+  constructor() {
+    this.summaries = new Map(); // Store summaries per conversation
+  }
+
+  async summarizeConversation(messages, nimModel) {
+    // Extract key information from the conversation
+    const systemMessages = messages.filter(m => m.role === 'system');
+    const conversationMessages = messages.filter(m => m.role !== 'system');
+    
+    // Create a summary prompt that captures all important context
+    const summaryPrompt = {
+      role: 'system',
+      content: `You are a conversation summarizer. Create a detailed summary of the following conversation that captures:
+1. ALL character personalities, traits, and backgrounds mentioned
+2. ALL important events, plot points, and story developments
+3. ALL key relationships between characters
+4. ALL important decisions or choices made
+5. The current situation and ongoing context
+6. Any rules, settings, or world-building elements established
+
+Be extremely detailed and comprehensive. This summary will replace the full conversation history to save context space while maintaining continuity.`
+    };
+
+    const conversationText = conversationMessages
+      .map(m => `${m.role}: ${m.content}`)
+      .join('\n\n');
+
+    const summaryRequest = {
+      model: nimModel,
+      messages: [
+        summaryPrompt,
+        { role: 'user', content: `Please summarize this conversation while preserving ALL important context:\n\n${conversationText}` }
+      ],
+      temperature: 0.3,
+      max_tokens: 2000
+    };
+
+    try {
+      const response = await axios.post(`${NIM_API_BASE}/chat/completions`, summaryRequest, {
+        headers: {
+          'Authorization': `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 60000
+      });
+
+      const summary = response.data.choices[0]?.message?.content || '';
+      
+      // Create a system message that includes the summary
+      const contextMessage = {
+        role: 'system',
+        content: `[PREVIOUS CONVERSATION SUMMARY - Maintain continuity with this context]\n\n${summary}\n\n[END SUMMARY - Continue the conversation naturally based on this context]`
+      };
+
+      return contextMessage;
+    } catch (error) {
+      console.error('❌ Summarization failed:', error.message);
+      return null;
+    }
+  }
+
+  async compressConversation(messages, nimModel) {
+    if (!messages || messages.length === 0) return messages;
+    
+    const estimatedTokens = estimateTokens(JSON.stringify(messages));
+    
+    // If under the limit, no compression needed
+    if (estimatedTokens <= MAX_TOKENS_PER_REQUEST) {
+      return messages;
+    }
+
+    console.log(`🔄 Conversation too large (${estimatedTokens} tokens). Compressing...`);
+
+    const systemMessages = messages.filter(m => m.role === 'system');
+    const conversationMessages = messages.filter(m => m.role !== 'system');
+    
+    // Keep the last few exchanges intact (most recent context)
+    const RECENT_EXCHANGES = 3; // Keep last 3 complete exchanges
+    let recentStartIndex = conversationMessages.length;
+    let exchangeCount = 0;
+    
+    for (let i = conversationMessages.length - 1; i >= 0; i--) {
+      if (conversationMessages[i].role === 'user') {
+        exchangeCount++;
+        if (exchangeCount >= RECENT_EXCHANGES) {
+          recentStartIndex = i;
+          break;
+        }
+      }
+    }
+    
+    const olderMessages = conversationMessages.slice(0, recentStartIndex);
+    const recentMessages = conversationMessages.slice(recentStartIndex);
+    
+    // Summarize older messages
+    if (olderMessages.length > 0) {
+      console.log(`📝 Summarizing ${olderMessages.length} older messages...`);
+      const summaryMessage = await this.summarizeConversation(
+        [...systemMessages, ...olderMessages], 
+        nimModel
+      );
+      
+      if (summaryMessage) {
+        // Combine: system messages + summary + recent messages
+        const compressedMessages = [
+          ...systemMessages,
+          summaryMessage,
+          ...recentMessages
+        ];
+        
+        const compressedTokens = estimateTokens(JSON.stringify(compressedMessages));
+        console.log(`✅ Compressed from ${estimatedTokens} to ${compressedTokens} tokens`);
+        
+        return compressedMessages;
+      }
+    }
+    
+    // If summarization fails, fall back to smart truncation
+    console.log('⚠️ Falling back to smart truncation...');
+    return this.smartTruncate(messages);
+  }
+
+  smartTruncate(messages) {
+    const systemMessages = messages.filter(m => m.role === 'system');
+    const conversationMessages = messages.filter(m => m.role !== 'system');
+    
+    const systemTokens = systemMessages.reduce((sum, msg) => sum + estimateTokens(msg.content), 0);
+    let availableTokens = MAX_TOKENS_PER_REQUEST - systemTokens - 500;
+    
+    const selectedMessages = [];
+    let tokensUsed = 0;
+    
+    // Work backwards to include most recent messages
+    for (let i = conversationMessages.length - 1; i >= 0; i--) {
+      const msgTokens = estimateTokens(conversationMessages[i].content);
+      if (tokensUsed + msgTokens <= availableTokens) {
+        selectedMessages.unshift(conversationMessages[i]);
+        tokensUsed += msgTokens;
+      } else {
+        break;
+      }
+    }
+    
+    return [...systemMessages, ...selectedMessages];
+  }
+}
+
+const summarizer = new ConversationSummarizer();
 
 // ===== HELPER FUNCTIONS =====
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Better token estimation
 function estimateTokens(text) {
   if (!text) return 0;
   const str = typeof text === 'string' ? text : JSON.stringify(text);
   return Math.ceil(str.length / 4);
 }
 
-// IMPROVED: Smart conversation chunking that preserves context
-function smartChunkConversation(messages, maxTokens = MAX_TOKENS_PER_REQUEST) {
-  if (!messages || messages.length === 0) return null;
-  
-  // If messages fit within limit, no chunking needed
-  const totalTokens = estimateTokens(JSON.stringify(messages));
-  if (totalTokens <= maxTokens) return null;
-  
-  const systemMessages = messages.filter(m => m.role === 'system');
-  const conversationMessages = messages.filter(m => m.role !== 'system');
-  
-  // Find the last user message
-  const lastUserMessageIndex = [...conversationMessages].reverse().findIndex(m => m.role === 'user');
-  if (lastUserMessageIndex === -1) return null; // No user message found
-  
-  const actualLastUserIndex = conversationMessages.length - 1 - lastUserMessageIndex;
-  
-  // Strategy: Keep all system messages + last N messages that fit within limit
-  const systemTokens = systemMessages.reduce((sum, msg) => sum + estimateTokens(msg.content), 0);
-  let availableTokens = maxTokens - systemTokens - 500; // Reserve 500 tokens for response
-  
-  // Start from the end and work backwards to include most recent context
-  const selectedMessages = [];
-  let tokensUsed = 0;
-  
-  // Always include the last user message and any assistant responses after it
-  for (let i = actualLastUserIndex; i < conversationMessages.length; i++) {
-    const msgTokens = estimateTokens(conversationMessages[i].content);
-    if (tokensUsed + msgTokens <= availableTokens) {
-      selectedMessages.push(conversationMessages[i]);
-      tokensUsed += msgTokens;
-    }
-  }
-  
-  // Then add previous messages from the last user message backwards
-  let includedCount = selectedMessages.length;
-  for (let i = actualLastUserIndex - 1; i >= 0 && tokensUsed < availableTokens; i--) {
-    const msgTokens = estimateTokens(conversationMessages[i].content);
-    if (tokensUsed + msgTokens <= availableTokens) {
-      selectedMessages.unshift(conversationMessages[i]);
-      tokensUsed += msgTokens;
-      includedCount++;
-    } else {
-      break;
-    }
-  }
-  
-  // If we couldn't even fit the last exchange, just keep the minimum
-  if (selectedMessages.length < 2) {
-    const lastExchange = conversationMessages.slice(Math.max(0, actualLastUserIndex - 1));
-    return [...systemMessages, ...lastExchange];
-  }
-  
-  console.log(`✂️ Smart truncation: Kept ${includedCount}/${conversationMessages.length} messages (${tokensUsed} tokens)`);
-  return [...systemMessages, ...selectedMessages];
-}
-
-// Helper: Call with smart retry logic
 async function callWithRetry(fn, context = '') {
   let lastError;
   
@@ -163,7 +257,6 @@ async function callWithRetry(fn, context = '') {
       }
       
       console.log(`⚠️ ${context} Rate limited (attempt ${attempt + 1}/${RETRY_CONFIG.maxRetries + 1}), waiting ${Math.round(waitTime/1000)}s...`);
-      console.log(`   Error details: ${error.response?.status} - ${error.response?.data?.error?.message || error.message}`);
       await sleep(waitTime);
     }
   }
@@ -182,7 +275,6 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE
 const SHOW_REASONING = false;
 const ENABLE_THINKING_MODE = false;
 
@@ -232,7 +324,8 @@ app.get('/health', (req, res) => {
     thinking_mode: ENABLE_THINKING_MODE,
     bucket_tokens: requestBucket.tokens,
     bucket_capacity: requestBucket.capacity,
-    max_tokens_per_request: MAX_TOKENS_PER_REQUEST
+    max_tokens_per_request: MAX_TOKENS_PER_REQUEST,
+    context_preservation: 'summarization'
   });
 });
 
@@ -264,15 +357,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     const estimatedTokens = estimateTokens(JSON.stringify(messages));
     console.log(`📊 Estimated total tokens: ${estimatedTokens}`);
     
-    // FIXED: Use smart truncation instead of chunking to preserve context
+    // MAIN FIX: Use summarization to preserve full context
     let processedMessages = messages;
-    if (estimatedTokens > MAX_TOKENS_PER_REQUEST && !stream) {
-      console.log(`🔄 Large request detected (${estimatedTokens} tokens). Smart truncation...`);
-      const truncatedMessages = smartChunkConversation(messages);
-      if (truncatedMessages) {
-        processedMessages = truncatedMessages;
-        console.log(`📦 Reduced to ${estimateTokens(JSON.stringify(processedMessages))} tokens`);
-      }
+    if (estimatedTokens > SUMMARY_TRIGGER_TOKENS) {
+      console.log(`🔄 Conversation getting long (${estimatedTokens} tokens). Applying context preservation...`);
+      processedMessages = await summarizer.compressConversation(messages, nimModel);
     }
     
     // Prepare the request
@@ -280,7 +369,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       model: nimModel,
       messages: processedMessages,
       temperature: temperature || 0.6,
-      max_tokens: max_tokens || 4096, // Reduced from 9024 to be safer
+      max_tokens: max_tokens || 4096,
       stream: stream || false
     };
     
@@ -333,14 +422,13 @@ app.post('/v1/chat/completions', async (req, res) => {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
                 
-                // FIX: Ensure we're not repeating user's messages in the response
+                // Filter out conversation completion attempts
                 if (content && isFirstContent) {
                   isFirstContent = false;
-                  // Check if the model is trying to continue the conversation instead of responding
                   if (content.startsWith('Human:') || content.startsWith('User:') || 
-                      content.includes(messages[messages.length - 1]?.content?.substring(0, 20))) {
-                    console.warn('⚠️ Detected model trying to complete user message, filtering...');
-                    return; // Skip this chunk
+                      content.match(/^(Assistant|AI|Bot):/)) {
+                    console.warn('⚠️ Filtered conversation completion prefix');
+                    return;
                   }
                 }
                 
@@ -394,18 +482,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Transform NIM response to OpenAI format
       let responseContent = response.data.choices[0]?.message?.content || '';
       
-      // FIX: Additional check to ensure model isn't completing the conversation
-      const lastUserMessage = messages[messages.length - 1]?.content || '';
-      if (responseContent.includes(lastUserMessage.substring(0, 50))) {
-        console.warn('⚠️ Response contains user message, cleaning up...');
-        // Try to extract just the assistant's part
-        const assistantParts = responseContent.split(/\n(?=(?:Assistant|AI|Bot): )/);
-        if (assistantParts.length > 1) {
-          responseContent = assistantParts[assistantParts.length - 1];
-        }
-      }
-      
-      // Remove any "Human:" or "User:" prefixes the model might generate
+      // Clean up any conversation completion artifacts
       responseContent = responseContent.replace(/^(?:Human|User|Assistant|AI|Bot):\s*/gm, '');
       
       const openaiResponse = {
@@ -438,7 +515,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Log token usage
       if (response.data.usage) {
         const totalTokens = response.data.usage.total_tokens || 0;
-        console.log(`📊 Total tokens used: ${totalTokens} (Prompt: ${response.data.usage.prompt_tokens || 0}, Completion: ${response.data.usage.completion_tokens || 0})`);
+        console.log(`📊 Total tokens used: ${totalTokens}`);
       }
       
       res.json(openaiResponse);
@@ -449,10 +526,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     if (error.response) {
       console.error(`   Status: ${error.response.status}`);
-      console.error(`   Headers:`, JSON.stringify(error.response.headers, null, 2));
       console.error(`   Data:`, JSON.stringify(error.response.data, null, 2));
-    } else if (error.request) {
-      console.error(`   No response received:`, error.code);
     }
     
     const status = error.response?.status || 500;
@@ -490,11 +564,9 @@ app.listen(PORT, () => {
   console.log(`🚀 OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`📊 Rate limiting: Token bucket (30 req/min, refill 1/sec)`);
   console.log(`🔄 Concurrent requests: 2 max`);
-  console.log(`🔄 Retry config: ${RETRY_CONFIG.maxRetries + 1} attempts with exponential backoff`);
-  console.log(`📦 Smart truncation: Enabled for requests > ${MAX_TOKENS_PER_REQUEST} tokens`);
+  console.log(`🧠 Context preservation: Intelligent summarization`);
+  console.log(`📝 Summarization triggers at: ${SUMMARY_TRIGGER_TOKENS} tokens`);
+  console.log(`💾 Recent exchanges preserved: Last 3 exchanges always intact`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
   console.log(`🔍 Health check: http://localhost:${PORT}/health`);
-  console.log(`💭 Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`🧠 Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`🛡️ Anti-completion protection: Enabled`);
 });
