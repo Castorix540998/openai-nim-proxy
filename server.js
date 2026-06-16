@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy (Optimized with Queue Management)
+// server.js - Smart Context Proxy with Triton Queue Management
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -11,18 +11,128 @@ const PORT = process.env.PORT || 3000;
 process.env.NIM_TRITON_MAX_QUEUE_SIZE = process.env.NIM_TRITON_MAX_QUEUE_SIZE || '100';
 process.env.NIM_TRITON_MAX_BATCH_SIZE = process.env.NIM_TRITON_MAX_BATCH_SIZE || '8';
 
-// ===== CONFIGURATION =====
-const MAX_TOKENS_PER_REQUEST = 2000; // Can be slightly larger now
+// ===== SMART CONTEXT CONFIGURATION =====
+const MAX_TOKENS = 2500;           // Target token limit
 const MAX_RESPONSE_TOKENS = 2048;
-const RATE_LIMIT_DELAY = 8000;      // 8 seconds (reduced from 15s)
-const MAX_RETRIES = 4;              // More retries since queue handles waiting
-const RETRY_DELAY_BASE = 5000;      // 5 second base retry delay
+const MIN_DELAY = 8000;           // 8 seconds between requests
+const MAX_RETRIES = 4;
+const RETRY_BASE_DELAY = 5000;    // 5 second base for retry backoff
 
-// ===== REQUEST QUEUE MANAGEMENT =====
+const IMPORTANCE_KEYWORDS = [      // Words that signal important context
+  'name', 'remember', 'important', 'secret', 'promise',
+  'backstory', 'character', 'personality', 'always', 'never',
+  'love', 'hate', 'family', 'power', 'ability', 'rule',
+  'remember that', 'don\'t forget', 'key', 'crucial', 'essential'
+];
+
+// ===== SMART CONTEXT MANAGER =====
+class SmartContextManager {
+  
+  // Score messages by importance
+  scoreImportance(message) {
+    let score = 0;
+    const content = (message.content || '').toLowerCase();
+    
+    // Recent messages are more important
+    score += 10;
+    
+    // System messages are very important
+    if (message.role === 'system') score += 50;
+    
+    // Messages with key details
+    IMPORTANCE_KEYWORDS.forEach(keyword => {
+      if (content.includes(keyword)) score += 15;
+    });
+    
+    // Longer messages might contain more context
+    if (content.length > 200) score += 10;
+    if (content.length > 500) score += 5;
+    
+    // Messages with quotes or specific details
+    if (content.includes('"') || content.includes("'")) score += 5;
+    
+    // Messages that seem to establish rules or facts
+    if (content.match(/(is|are|was|were|will be|always|never) (a|the|an)/)) score += 10;
+    
+    return score;
+  }
+  
+  prepareContext(messages) {
+    const totalTokens = estimateTokens(JSON.stringify(messages));
+    
+    // If under limit, don't touch anything
+    if (totalTokens <= MAX_TOKENS) {
+      return messages;
+    }
+    
+    console.log(`🧠 Smart compression: ${totalTokens} → ${MAX_TOKENS} tokens`);
+    
+    // Separate system messages (keep all)
+    const systemMessages = messages.filter(m => m.role === 'system');
+    const conversationMessages = messages.filter(m => m.role !== 'system');
+    
+    // Score and sort conversation messages by importance
+    const scoredMessages = conversationMessages.map((msg, index) => ({
+      ...msg,
+      _score: this.scoreImportance(msg),
+      _index: index // Keep original order reference
+    }));
+    
+    // Always keep the last 3 messages (immediate context)
+    const lastThree = scoredMessages.slice(-3);
+    const olderMessages = scoredMessages.slice(0, -3);
+    
+    // Sort older messages by importance score
+    const importantOlder = olderMessages
+      .sort((a, b) => b._score - a._score)
+      .filter(msg => msg._score > 20); // Only keep moderately important ones
+    
+    // Combine: system + important older + recent
+    let selectedMessages = [
+      ...systemMessages,
+      ...importantOlder.sort((a, b) => a._index - b._index), // Restore chronological order
+      ...lastThree
+    ];
+    
+    // Remove scoring metadata
+    selectedMessages = selectedMessages.map(({ _score, _index, ...msg }) => msg);
+    
+    // If still too large, progressively trim older messages
+    while (estimateTokens(JSON.stringify(selectedMessages)) > MAX_TOKENS) {
+      const nonSystemNonRecent = selectedMessages.filter(
+        m => m.role !== 'system' && !lastThree.includes(m)
+      );
+      
+      if (nonSystemNonRecent.length === 0) {
+        // Emergency: truncate content of recent messages
+        selectedMessages = selectedMessages.map(msg => ({
+          ...msg,
+          content: msg.content.substring(0, Math.floor(msg.content.length * 0.7))
+        }));
+      } else {
+        // Remove least important older message
+        const leastImportant = nonSystemNonRecent.reduce((min, msg) => 
+          (this.scoreImportance(msg) < this.scoreImportance(min)) ? msg : min
+        );
+        selectedMessages = selectedMessages.filter(m => m !== leastImportant);
+      }
+    }
+    
+    const finalTokens = estimateTokens(JSON.stringify(selectedMessages));
+    console.log(`✅ Preserved ${selectedMessages.length} messages (${finalTokens} tokens)`);
+    
+    return selectedMessages;
+  }
+}
+
+const contextManager = new SmartContextManager();
+
+// ===== REQUEST QUEUE WITH TRITON SUPPORT =====
 class RequestQueue {
   constructor() {
     this.queue = [];
     this.processing = false;
+    this.lastRequestTime = 0;
   }
 
   async add(fn) {
@@ -43,11 +153,11 @@ class RequestQueue {
       try {
         // Wait rate limit delay between requests
         const now = Date.now();
-        const timeSinceLastRequest = now - (this.lastRequestTime || 0);
+        const timeSinceLastRequest = now - this.lastRequestTime;
         
-        if (timeSinceLastRequest < RATE_LIMIT_DELAY) {
-          const waitTime = RATE_LIMIT_DELAY - timeSinceLastRequest;
-          console.log(`⏳ Queue: Waiting ${Math.round(waitTime/1000)}s before next request...`);
+        if (timeSinceLastRequest < MIN_DELAY) {
+          const waitTime = MIN_DELAY - timeSinceLastRequest;
+          console.log(`⏳ Queue: Waiting ${Math.round(waitTime/1000)}s...`);
           await sleep(waitTime);
         }
         
@@ -65,125 +175,12 @@ class RequestQueue {
 
 const requestQueue = new RequestQueue();
 
-// ===== CONTEXT MANAGEMENT =====
-class ContextManager {
-  prepareContext(messages) {
-    const systemMessages = messages.filter(m => m.role === 'system');
-    const conversationMessages = messages.filter(m => m.role !== 'system');
-    
-    const totalTokens = estimateTokens(JSON.stringify(messages));
-    
-    // If under limit, return as-is
-    if (totalTokens <= MAX_TOKENS_PER_REQUEST) {
-      return messages;
-    }
-    
-    console.log(`🔄 Compressing ${totalTokens} tokens to fit ${MAX_TOKENS_PER_REQUEST} limit...`);
-    
-    const preparedMessages = [];
-    
-    // Keep system message (truncated if needed)
-    if (systemMessages.length > 0) {
-      preparedMessages.push({
-        role: 'system',
-        content: this.truncate(systemMessages[0].content, 400)
-      });
-    }
-    
-    // Find the last user message index
-    let lastUserIndex = -1;
-    for (let i = conversationMessages.length - 1; i >= 0; i--) {
-      if (conversationMessages[i].role === 'user') {
-        lastUserIndex = i;
-        break;
-      }
-    }
-    
-    if (lastUserIndex >= 0) {
-      // Add context from before the last user message
-      if (lastUserIndex > 0) {
-        const contextMsg = conversationMessages[lastUserIndex - 1];
-        preparedMessages.push({
-          role: contextMsg.role,
-          content: this.truncate(contextMsg.content, 300)
-        });
-      }
-      
-      // Add the last user message
-      preparedMessages.push({
-        role: 'user',
-        content: this.truncate(conversationMessages[lastUserIndex].content, 800)
-      });
-      
-      // Add any responses after the last user message
-      for (let i = lastUserIndex + 1; i < conversationMessages.length; i++) {
-        preparedMessages.push({
-          role: conversationMessages[i].role,
-          content: this.truncate(conversationMessages[i].content, 500)
-        });
-      }
-    } else {
-      // Fallback: last 2 messages
-      preparedMessages.push(...conversationMessages.slice(-2).map(msg => ({
-        role: msg.role,
-        content: this.truncate(msg.content, 400)
-      })));
-    }
-    
-    // Create brief context summary for older messages
-    if (lastUserIndex > 1) {
-      const olderMsgs = conversationMessages.slice(0, lastUserIndex - 1);
-      const contextSummary = this.createContextSummary(olderMsgs);
-      
-      preparedMessages.splice(1, 0, {
-        role: 'system',
-        content: `[Context: ${contextSummary}]`
-      });
-    }
-    
-    const finalTokens = estimateTokens(JSON.stringify(preparedMessages));
-    console.log(`✅ Compressed to ${finalTokens} tokens`);
-    
-    // Emergency: if still too large
-    if (finalTokens > MAX_TOKENS_PER_REQUEST) {
-      console.log('🚨 Emergency truncation...');
-      return [preparedMessages[0], preparedMessages[preparedMessages.length - 1]];
-    }
-    
-    return preparedMessages;
-  }
-  
-  truncate(content, maxTokens) {
-    if (!content) return '';
-    const maxChars = maxTokens * 4;
-    return content.length <= maxChars ? content : content.substring(0, maxChars) + '...';
-  }
-  
-  createContextSummary(messages) {
-    // Extract key topics from recent messages
-    const topics = messages
-      .filter(m => m.role === 'user')
-      .slice(-3)
-      .map(m => {
-        const words = m.content.split(' ').slice(0, 10);
-        return words.join(' ');
-      })
-      .join(' → ');
-    
-    return `Previous topics: ${topics}`.substring(0, 400);
-  }
-}
-
-const contextManager = new ContextManager();
-
-// ===== HELPER FUNCTIONS =====
-
+// ===== HELPERS =====
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function estimateTokens(text) {
   if (!text) return 0;
-  const str = typeof text === 'string' ? text : JSON.stringify(text);
-  return Math.ceil(str.length / 4);
+  return Math.ceil(JSON.stringify(text).length / 4);
 }
 
 async function callWithRetry(fn, context = '') {
@@ -202,21 +199,20 @@ async function callWithRetry(fn, context = '') {
         throw error;
       }
       
-      // Check for Retry-After header first
+      // Check for Retry-After header (Triton provides this)
       let waitTime;
       const retryAfter = error.response?.headers?.['retry-after'];
       
       if (retryAfter) {
         waitTime = parseInt(retryAfter) * 1000;
-        console.log(`⚠️ Got Retry-After: ${retryAfter}s`);
+        console.log(`⚠️ Triton Retry-After: ${retryAfter}s`);
       } else {
-        // Exponential backoff: 5s, 10s, 20s, 40s
-        waitTime = RETRY_DELAY_BASE * Math.pow(2, attempt);
-        // Add jitter
+        // Exponential backoff with jitter
+        waitTime = RETRY_BASE_DELAY * Math.pow(2, attempt);
         waitTime = waitTime * (0.8 + Math.random() * 0.4);
       }
       
-      console.log(`⚠️ ${context} attempt ${attempt + 1}/${MAX_RETRIES + 1} failed (${status}). Waiting ${Math.round(waitTime/1000)}s...`);
+      console.log(`⚠️ ${context} attempt ${attempt + 1}/${MAX_RETRIES + 1} (${status}). Waiting ${Math.round(waitTime/1000)}s...`);
       await sleep(waitTime);
     }
   }
@@ -226,13 +222,13 @@ async function callWithRetry(fn, context = '') {
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Model mapping
+const SHOW_REASONING = false;
+const ENABLE_THINKING_MODE = false;
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'minimaxai/minimax-m3',
@@ -243,61 +239,48 @@ const MODEL_MAPPING = {
   'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b'
 };
 
-function resolveModel(openaiModel) {
-  if (MODEL_MAPPING[openaiModel]) return MODEL_MAPPING[openaiModel];
-  
-  const modelLower = openaiModel.toLowerCase();
-  if (modelLower.includes('gpt-4') || modelLower.includes('opus')) {
-    return 'meta/llama-3.1-405b-instruct';
-  } else if (modelLower.includes('claude') || modelLower.includes('gemini')) {
-    return 'meta/llama-3.1-70b-instruct';
-  }
+function resolveModel(model) {
+  if (MODEL_MAPPING[model]) return MODEL_MAPPING[model];
+  const lower = model.toLowerCase();
+  if (lower.includes('gpt-4') || lower.includes('opus')) return 'meta/llama-3.1-405b-instruct';
+  if (lower.includes('claude') || lower.includes('gemini')) return 'meta/llama-3.1-70b-instruct';
   return 'meta/llama-3.1-8b-instruct';
 }
 
-// Health check
+// Health check with Triton info
 app.get('/health', (req, res) => {
-  res.json({
+  res.json({ 
     status: 'ok',
-    max_tokens: MAX_TOKENS_PER_REQUEST,
-    rate_limit_delay: `${RATE_LIMIT_DELAY/1000}s`,
+    strategy: 'smart_importance_scoring',
+    max_tokens: MAX_TOKENS,
+    min_delay: `${MIN_DELAY/1000}s`,
     triton_queue_size: process.env.NIM_TRITON_MAX_QUEUE_SIZE,
-    queue_length: requestQueue.queue.length
+    triton_batch_size: process.env.NIM_TRITON_MAX_BATCH_SIZE,
+    queue_length: requestQueue.queue.length,
+    max_retries: MAX_RETRIES
   });
 });
 
-// Models endpoint
 app.get('/v1/models', (req, res) => {
-  const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nvidia-nim-proxy'
+  const models = Object.keys(MODEL_MAPPING).map(id => ({
+    id, object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy'
   }));
-  
   res.json({ object: 'list', data: models });
 });
 
-// Main chat completions endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    if (!messages || messages.length === 0) {
-      return res.status(400).json({
-        error: { message: 'No messages provided', type: 'invalid_request_error', code: 400 }
-      });
+    if (!messages?.length) {
+      return res.status(400).json({ error: { message: 'No messages', code: 400 } });
     }
     
     const nimModel = resolveModel(model);
-    
-    // Prepare context
     const preparedMessages = contextManager.prepareContext(messages);
-    const inputTokens = estimateTokens(JSON.stringify(preparedMessages));
     
-    console.log(`📊 Request: ${inputTokens} tokens → ${nimModel}`);
+    console.log(`📤 Sending ${estimateTokens(JSON.stringify(preparedMessages))} tokens to ${nimModel}`);
     
-    // Prepare request
     const nimRequest = {
       model: nimModel,
       messages: preparedMessages,
@@ -306,7 +289,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Use queue to manage requests
+    if (ENABLE_THINKING_MODE) {
+      nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
+    }
+    
+    // Use queue + retry with Triton support
     const response = await requestQueue.add(() =>
       callWithRetry(
         () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
@@ -335,22 +322,25 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      const content = response.data.choices[0]?.message?.content || '';
+      let content = response.data.choices[0]?.message?.content || '';
+      
+      // Clean up any conversation completion artifacts
+      content = content.replace(/^(?:Human|User|Assistant|AI|Bot):\s*/gm, '');
       
       res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: [{
           index: 0,
-          message: { role: 'assistant', content: content },
+          message: { role: 'assistant', content },
           finish_reason: response.data.choices[0]?.finish_reason || 'stop'
         }],
         usage: response.data.usage || {
-          prompt_tokens: inputTokens,
+          prompt_tokens: estimateTokens(JSON.stringify(preparedMessages)),
           completion_tokens: estimateTokens(content),
-          total_tokens: inputTokens + estimateTokens(content)
+          total_tokens: estimateTokens(JSON.stringify(preparedMessages)) + estimateTokens(content)
         }
       });
     }
@@ -359,39 +349,38 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('❌ Error:', error.message);
     
     const status = error.response?.status || 500;
+    const retryAfter = error.response?.headers?.['retry-after'];
     
     if (status === 429) {
-      console.log('💡 Tip: Try increasing NIM_TRITON_MAX_QUEUE_SIZE environment variable');
+      console.log('💡 Triton queue full. Try increasing NIM_TRITON_MAX_QUEUE_SIZE');
     }
     
     res.status(status).json({
       error: {
-        message: status === 429
+        message: status === 429 
           ? 'Server busy. Request queued. Try increasing NIM_TRITON_MAX_QUEUE_SIZE.'
-          : error.message || 'Internal server error',
+          : error.response?.data?.error?.message || error.message,
         type: status === 429 ? 'rate_limit_error' : 'server_error',
-        code: status
+        code: status,
+        retry_after: retryAfter ? parseInt(retryAfter) : undefined
       }
     });
   }
 });
 
-// Catch-all
 app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
+  res.status(404).json({ error: { message: 'Not found', code: 404 } });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Proxy running on port ${PORT}`);
-  console.log(`📦 Max input: ${MAX_TOKENS_PER_REQUEST} tokens`);
+  console.log(`🚀 Smart Context Proxy with Triton Support`);
+  console.log(`📡 Port: ${PORT}`);
+  console.log(`🧠 Strategy: Importance-based context preservation`);
+  console.log(`📦 Max tokens: ${MAX_TOKENS}`);
   console.log(`📝 Max response: ${MAX_RESPONSE_TOKENS} tokens`);
-  console.log(`⏱️ Rate: 1 request per ${RATE_LIMIT_DELAY/1000}s`);
-  console.log(`📋 Triton queue size: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
+  console.log(`⏱️ Rate: 1 request per ${MIN_DELAY/1000}s`);
+  console.log(`📋 Triton queue: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
+  console.log(`📊 Triton batch: ${process.env.NIM_TRITON_MAX_BATCH_SIZE}`);
   console.log(`🔄 Max retries: ${MAX_RETRIES}`);
+  console.log(`🔑 API Base: ${NIM_API_BASE}`);
 });
