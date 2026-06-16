@@ -2,24 +2,40 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const pLimit = require('p-limit'); // Add this package: npm install p-limit
+const pLimit = require('p-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Rate limiting setup
-const limiter = pLimit(3); // Limit to 3 concurrent requests to NVIDIA API
+// Rate limiting setup - reduced to 1 concurrent request to minimize 429 errors
+const limiter = pLimit(1); // Process one request at a time
 
-// Retry configuration
+// Retry configuration - more aggressive retry with longer waits
 const RETRY_CONFIG = {
-  maxRetries: 3,
-  initialDelay: 1000, // 1 second
-  maxDelay: 30000, // 30 seconds
-  backoffFactor: 2
+  maxRetries: 5,        // Try up to 5 times
+  initialDelay: 5000,   // Wait 5 seconds before first retry
+  maxDelay: 60000,      // Wait up to 60 seconds
+  backoffFactor: 2      // Double the wait time each retry
 };
+
+// Request throttling - enforce minimum time between requests
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 3000; // 3 seconds between requests
 
 // Helper: sleep function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper: throttle requests to avoid rate limits
+async function throttleRequest() {
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+    const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+    console.log(`⏳ Throttling: Waiting ${waitTime}ms before next request...`);
+    await sleep(waitTime);
+  }
+  lastRequestTime = Date.now();
+}
 
 // Helper: call with retry for 429 errors
 async function callWithRetry(fn, context = '') {
@@ -163,6 +179,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
     }
+    
+    // Throttle requests to avoid rate limits
+    await throttleRequest();
     
     // Make request to NVIDIA NIM API with concurrency limiting and retry logic
     const response = await limiter(async () => {
@@ -322,4 +341,6 @@ app.listen(PORT, () => {
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Rate limiting: 1 concurrent request, ${MIN_REQUEST_INTERVAL}ms between requests`);
+  console.log(`Retry config: ${RETRY_CONFIG.maxRetries} retries, starting at ${RETRY_CONFIG.initialDelay}ms`);
 });
