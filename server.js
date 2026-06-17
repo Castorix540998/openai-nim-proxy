@@ -16,7 +16,7 @@ process.env.NIM_MAX_CPU_LORAS = process.env.NIM_MAX_CPU_LORAS || '10';
 // ===== TOKEN-BASED THROTTLING =====
 // NVIDIA free tier likely has a token/second limit
 const MAX_TOKENS_PER_SECOND = 17;    // Adjust based on your tier
-const MAX_TOKENS_PER_MINUTE = 1000000;  // Total token budget per minute
+const MAX_TOKENS_PER_MINUTE = 2000;  // Total token budget per minute
 let tokenUsageWindow = [];           // Track token usage timestamps
 
 function estimateTokens(messages) {
