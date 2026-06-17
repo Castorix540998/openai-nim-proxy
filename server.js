@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 
 // ===== NVIDIA TRITON QUEUE CONFIGURATION =====
 // This tells NIM to queue requests instead of returning 429
-process.env.NIM_TRITON_MAX_QUEUE_SIZE = process.env.NIM_TRITON_MAX_QUEUE_SIZE || '200';
+process.env.NIM_TRITON_MAX_QUEUE_SIZE = process.env.NIM_TRITON_MAX_QUEUE_SIZE || '500';
 process.env.NIM_TRITON_MAX_BATCH_SIZE = process.env.NIM_TRITON_MAX_BATCH_SIZE || '16';
 // Additional Triton settings for better queue handling
 process.env.NIM_TRITON_MIN_WORKERS = process.env.NIM_TRITON_MIN_WORKERS || '1';
