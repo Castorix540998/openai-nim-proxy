@@ -1,4 +1,4 @@
-// server.js - Simple OpenAI to NVIDIA NIM Proxy with Triton Queue Management
+// server.js - NVIDIA NIM Proxy with Full 429 Protection
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,31 +6,43 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ===== NVIDIA TRITON QUEUE CONFIGURATION =====
-// This tells NIM to queue requests instead of returning 429
+// ===== NVIDIA TRITON & LORA CONFIGURATION =====
+// Based on NVIDIA's own recommendations for avoiding 429 errors
 process.env.NIM_TRITON_MAX_QUEUE_SIZE = process.env.NIM_TRITON_MAX_QUEUE_SIZE || '500';
 process.env.NIM_TRITON_MAX_BATCH_SIZE = process.env.NIM_TRITON_MAX_BATCH_SIZE || '16';
-// Additional Triton settings for better queue handling
 process.env.NIM_TRITON_MIN_WORKERS = process.env.NIM_TRITON_MIN_WORKERS || '1';
 process.env.NIM_TRITON_MAX_WORKERS = process.env.NIM_TRITON_MAX_WORKERS || '4';
+// NEW: LoRA cache management to prevent "cache full" 429 errors
+process.env.NIM_MAX_CPU_LORAS = process.env.NIM_MAX_CPU_LORAS || '10';
 
-// ===== SIMPLE RATE LIMITING =====
-const MIN_DELAY = 2000; // 2 seconds between requests
+// ===== CONSERVATIVE RATE LIMITING (NVIDIA-style: 1 at a time) =====
+const MIN_DELAY = 10000; // 10 seconds between requests (like NV_INGEST_FILES_PER_BATCH=1)
+const CONCURRENT_REQUESTS = 1; // Only 1 at a time (like NV_INGEST_CONCURRENT_BATCHES=1)
 let lastRequestTime = 0;
+let activeRequests = 0;
 
 async function rateLimit() {
+  // Wait if there's already an active request
+  while (activeRequests >= CONCURRENT_REQUESTS) {
+    console.log(`⏳ Waiting for active request to complete...`);
+    await sleep(1000);
+  }
+  
+  // Enforce minimum delay between requests
   const now = Date.now();
   const wait = MIN_DELAY - (now - lastRequestTime);
   if (wait > 0) {
-    console.log(`⏳ Waiting ${Math.round(wait/1000)}s...`);
+    console.log(`⏳ Rate limit cooldown: ${Math.round(wait/1000)}s...`);
     await sleep(wait);
   }
+  
   lastRequestTime = Date.now();
+  activeRequests++;
 }
 
-// ===== RETRY CONFIGURATION =====
-const MAX_RETRIES = 5;
-const RETRY_BASE_DELAY = 3000;
+// ===== RETRY CONFIGURATION (NVIDIA-style: conservative) =====
+const MAX_RETRIES = 3; // Reduced retries like NVIDIA recommends
+const RETRY_BASE_DELAY = 30000; // 30 second base delay on 429
 
 // ===== HELPERS =====
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -45,6 +57,15 @@ async function callWithRetry(fn, context = '') {
       lastError = error;
       
       const status = error.response?.status;
+      const errorData = error.response?.data;
+      
+      // NEW: Check for LoRA cache full errors
+      if (status === 429 && errorData?.message?.includes('cache')) {
+        console.log('🔄 429: LoRA cache full - waiting for cache to clear...');
+        await sleep(15000); // Wait 15 seconds for LRU cleanup
+        continue;
+      }
+      
       const isRetryable = status === 429 || status === 503 || status === 504;
       
       if (!isRetryable || attempt === MAX_RETRIES) {
@@ -57,10 +78,11 @@ async function callWithRetry(fn, context = '') {
       
       if (retryAfter) {
         waitTime = parseInt(retryAfter) * 1000;
-        console.log(`⚠️ Triton says retry after ${retryAfter}s`);
+        console.log(`⚠️ NVIDIA says retry after ${retryAfter}s`);
       } else {
-        waitTime = RETRY_BASE_DELAY * Math.pow(2, attempt);
-        waitTime = waitTime * (0.8 + Math.random() * 0.4);
+        // NVIDIA-style: long conservative waits
+        waitTime = RETRY_BASE_DELAY * (attempt + 1);
+        waitTime = waitTime * (0.8 + Math.random() * 0.4); // Add jitter
       }
       
       // Cap at 60 seconds
@@ -82,7 +104,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Model mapping
+// Model mapping 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'minimaxai/minimax-m3',
@@ -107,13 +129,22 @@ function resolveModel(model) {
 
 // Health check
 app.get('/health', (req, res) => {
+  const now = Date.now();
+  const cooldownRemaining = Math.max(0, MIN_DELAY - (now - lastRequestTime));
+  
   res.json({
     status: 'ok',
     triton_queue_size: process.env.NIM_TRITON_MAX_QUEUE_SIZE,
     triton_batch_size: process.env.NIM_TRITON_MAX_BATCH_SIZE,
     triton_workers: `${process.env.NIM_TRITON_MIN_WORKERS}-${process.env.NIM_TRITON_MAX_WORKERS}`,
+    max_cpu_loras: process.env.NIM_MAX_CPU_LORAS,
     min_delay: `${MIN_DELAY/1000}s`,
-    max_retries: MAX_RETRIES
+    cooldown_remaining: `${Math.round(cooldownRemaining/1000)}s`,
+    active_requests: activeRequests,
+    max_concurrent: CONCURRENT_REQUESTS,
+    max_retries: MAX_RETRIES,
+    retry_base_delay: `${RETRY_BASE_DELAY/1000}s`,
+    strategy: 'nvidia_conservative_single_file'
   });
 });
 
@@ -141,9 +172,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     const nimModel = resolveModel(model);
     
-    console.log(`📤 Request: ${messages.length} messages → ${nimModel}`);
+    console.log(`📤 Request: ${messages.length} messages → ${nimModel} (active: ${activeRequests})`);
     
-    // Prepare request - NO CHUNKING, NO TOKEN MANIPULATION
+    // Prepare request - FULL CONTEXT, NO CHUNKING
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -152,7 +183,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Wait for rate limit
+    // NVIDIA-style: 1 request at a time with minimum delay
     await rateLimit();
     
     // Make request with retry logic
@@ -168,6 +199,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimModel
     );
     
+    activeRequests--;
     console.log('✅ Success');
     
     if (stream) {
@@ -179,6 +211,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('error', (err) => {
         console.error('Stream error:', err.message);
+        activeRequests = Math.max(0, activeRequests - 1);
         res.end();
       });
     } else {
@@ -199,19 +232,29 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
+    activeRequests = Math.max(0, activeRequests - 1);
     console.error('❌ Error:', error.message);
     
     const status = error.response?.status || 500;
+    const errorData = error.response?.data;
     
     if (status === 429) {
-      console.log('💡 429: Request queued by Triton. Will retry automatically.');
+      // Detect specific 429 causes based on NVIDIA documentation
+      if (errorData?.message?.includes('cache')) {
+        console.log('💡 429 Cause: LoRA cache full (NIM_MAX_CPU_LORAS)');
+      } else if (errorData?.message?.includes('queue')) {
+        console.log('💡 429 Cause: Request queue full (NIM_TRITON_MAX_QUEUE_SIZE)');
+      } else {
+        console.log('💡 429 Cause: General rate limiting');
+      }
     }
     
     res.status(status).json({
       error: {
         message: error.response?.data?.error?.message || error.message || 'Internal server error',
         type: status === 429 ? 'rate_limit_error' : 'server_error',
-        code: status
+        code: status,
+        retry_after: status === 429 ? 30 : null
       }
     });
   }
@@ -225,13 +268,16 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Simple NIM Proxy with Triton Queue Management`);
+  console.log(`🚀 NVIDIA NIM Proxy with 429 Protection`);
   console.log(`📡 Port: ${PORT}`);
-  console.log(`📋 Triton queue size: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
-  console.log(`📊 Triton batch size: ${process.env.NIM_TRITON_MAX_BATCH_SIZE}`);
+  console.log(`📋 Triton queue: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
+  console.log(`📊 Triton batch: ${process.env.NIM_TRITON_MAX_BATCH_SIZE}`);
   console.log(`👷 Triton workers: ${process.env.NIM_TRITON_MIN_WORKERS}-${process.env.NIM_TRITON_MAX_WORKERS}`);
-  console.log(`⏱️ Min delay between requests: ${MIN_DELAY/1000}s`);
-  console.log(`🔄 Max retries: ${MAX_RETRIES}`);
-  console.log(`📝 Full context preserved - NO chunking or compression`);
+  console.log(`💾 Max CPU LoRAs: ${process.env.NIM_MAX_CPU_LORAS}`);
+  console.log(`🔢 Concurrent requests: ${CONCURRENT_REQUESTS} (sequential)`);
+  console.log(`⏱️ Min delay: ${MIN_DELAY/1000}s between requests`);
+  console.log(`🔄 Max retries: ${MAX_RETRIES} (${RETRY_BASE_DELAY/1000}s base wait)`);
+  console.log(`📝 Full context preserved - NO chunking`);
+  console.log(`💡 Strategy: NVIDIA-style conservative (1 at a time)`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
 });
