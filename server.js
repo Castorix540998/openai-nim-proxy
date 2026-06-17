@@ -40,9 +40,11 @@ async function rateLimit() {
   activeRequests++;
 }
 
-// ===== RETRY CONFIGURATION (NVIDIA-style: conservative) =====
-const MAX_RETRIES = 3; // Reduced retries like NVIDIA recommends
-const RETRY_BASE_DELAY = 30000; // 30 second base delay on 429
+// ===== RETRY CONFIGURATION =====
+// NO retries on 429 - let Triton queue handle it
+// Retries only on server errors (503, 504, 500)
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY = 5000; // 5 second base delay for server errors
 
 // ===== HELPERS =====
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -57,38 +59,37 @@ async function callWithRetry(fn, context = '') {
       lastError = error;
       
       const status = error.response?.status;
-      const errorData = error.response?.data;
       
-      // NEW: Check for LoRA cache full errors
-      if (status === 429 && errorData?.message?.includes('cache')) {
-        console.log('🔄 429: LoRA cache full - waiting for cache to clear...');
-        await sleep(15000); // Wait 15 seconds for LRU cleanup
-        continue;
+      // NO RETRY on 429 - return immediately
+      if (status === 429) {
+        console.log(`🚫 429 Rate Limited - Not retrying. Let Triton queue handle it.`);
+        throw error;
       }
       
-      const isRetryable = status === 429 || status === 503 || status === 504;
+      // Only retry on server errors (500, 503, 504)
+      const isRetryable = status === 500 || status === 503 || status === 504;
       
       if (!isRetryable || attempt === MAX_RETRIES) {
         throw error;
       }
       
-      // Use Retry-After header if available (Triton provides this)
+      // Use Retry-After header if available
       let waitTime;
       const retryAfter = error.response?.headers?.['retry-after'];
       
       if (retryAfter) {
         waitTime = parseInt(retryAfter) * 1000;
-        console.log(`⚠️ NVIDIA says retry after ${retryAfter}s`);
+        console.log(`⚠️ Server says retry after ${retryAfter}s`);
       } else {
-        // NVIDIA-style: long conservative waits
-        waitTime = RETRY_BASE_DELAY * (attempt + 1);
+        // Exponential backoff for server errors
+        waitTime = RETRY_BASE_DELAY * Math.pow(2, attempt);
         waitTime = waitTime * (0.8 + Math.random() * 0.4); // Add jitter
       }
       
-      // Cap at 60 seconds
-      waitTime = Math.min(waitTime, 60000);
+      // Cap at 30 seconds for server errors
+      waitTime = Math.min(waitTime, 30000);
       
-      console.log(`⚠️ ${context} - Attempt ${attempt + 1}/${MAX_RETRIES + 1} (${status}). Waiting ${Math.round(waitTime/1000)}s...`);
+      console.log(`⚠️ ${context} - Attempt ${attempt + 1}/${MAX_RETRIES + 1} (${status} server error). Waiting ${Math.round(waitTime/1000)}s...`);
       await sleep(waitTime);
     }
   }
@@ -104,7 +105,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Model mapping 
+// Model mapping - UNCHANGED as requested
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'minimaxai/minimax-m3',
@@ -143,8 +144,9 @@ app.get('/health', (req, res) => {
     active_requests: activeRequests,
     max_concurrent: CONCURRENT_REQUESTS,
     max_retries: MAX_RETRIES,
-    retry_base_delay: `${RETRY_BASE_DELAY/1000}s`,
-    strategy: 'nvidia_conservative_single_file'
+    retry_on_429: false,
+    retry_on_server_errors: '500, 503, 504',
+    strategy: 'nvidia_conservative_no_429_retry'
   });
 });
 
@@ -186,7 +188,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     // NVIDIA-style: 1 request at a time with minimum delay
     await rateLimit();
     
-    // Make request with retry logic
+    // Make request with retry logic (NO retries on 429)
     const response = await callWithRetry(
       () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
         headers: {
@@ -247,6 +249,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       } else {
         console.log('💡 429 Cause: General rate limiting');
       }
+      console.log('🚫 Not retrying - let Triton queue handle it');
     }
     
     res.status(status).json({
@@ -254,7 +257,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         message: error.response?.data?.error?.message || error.message || 'Internal server error',
         type: status === 429 ? 'rate_limit_error' : 'server_error',
         code: status,
-        retry_after: status === 429 ? 30 : null
+        retry_after: status === 429 ? 10 : null
       }
     });
   }
@@ -276,7 +279,7 @@ app.listen(PORT, () => {
   console.log(`💾 Max CPU LoRAs: ${process.env.NIM_MAX_CPU_LORAS}`);
   console.log(`🔢 Concurrent requests: ${CONCURRENT_REQUESTS} (sequential)`);
   console.log(`⏱️ Min delay: ${MIN_DELAY/1000}s between requests`);
-  console.log(`🔄 Max retries: ${MAX_RETRIES} (${RETRY_BASE_DELAY/1000}s base wait)`);
+  console.log(`🔄 Retries: ${MAX_RETRIES} (for 500/503/504 only - NO retries on 429)`);
   console.log(`📝 Full context preserved - NO chunking`);
   console.log(`💡 Strategy: NVIDIA-style conservative (1 at a time)`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
