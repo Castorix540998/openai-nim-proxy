@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy with Token-Based Throttling
+// server.js - NVIDIA NIM Proxy with Message Merging
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -13,11 +13,52 @@ process.env.NIM_TRITON_MIN_WORKERS = process.env.NIM_TRITON_MIN_WORKERS || '1';
 process.env.NIM_TRITON_MAX_WORKERS = process.env.NIM_TRITON_MAX_WORKERS || '4';
 process.env.NIM_MAX_CPU_LORAS = process.env.NIM_MAX_CPU_LORAS || '10';
 
-// ===== TOKEN-BASED THROTTLING =====
-// NVIDIA free tier likely has a token/second limit
-const MAX_TOKENS_PER_SECOND = 17;    // Adjust based on your tier
-const MAX_TOKENS_PER_MINUTE = 2000;  // Total token budget per minute
-let tokenUsageWindow = [];           // Track token usage timestamps
+// ===== MESSAGE COUNT LIMIT WORKAROUND =====
+const MAX_MESSAGES = 10; // NVIDIA's limit
+const MAX_TOKENS_PER_SECOND = 50;
+const MAX_TOKENS_PER_MINUTE = 2000;
+let tokenUsageWindow = [];
+
+// Merge older messages to stay under the 10 message limit
+function mergeMessagesUnderLimit(messages) {
+  if (!messages || messages.length <= MAX_MESSAGES) {
+    return messages;
+  }
+  
+  console.log(`🔧 Merging ${messages.length} messages to fit ${MAX_MESSAGES} limit...`);
+  
+  const systemMessages = messages.filter(m => m.role === 'system');
+  const nonSystemMessages = messages.filter(m => m.role !== 'system');
+  
+  // Keep last 8 messages intact (4 exchanges)
+  const recentMessages = nonSystemMessages.slice(-8);
+  const olderMessages = nonSystemMessages.slice(0, -8);
+  
+  if (olderMessages.length === 0) {
+    // Just truncate to last 10
+    return [...systemMessages.slice(0, 1), ...nonSystemMessages.slice(-9)];
+  }
+  
+  // Merge all older messages into a single system message
+  const mergedContent = olderMessages
+    .map(m => `${m.role}: ${m.content.substring(0, 200)}`)
+    .join('\n');
+  
+  const summaryMessage = {
+    role: 'system',
+    content: `[Earlier conversation:\n${mergedContent.substring(0, 1000)}\n---\nContinue the conversation naturally.]`
+  };
+  
+  // Combine: 1 system + 1 summary + 8 recent = 10 messages total
+  const result = [
+    ...systemMessages.slice(0, 1),
+    summaryMessage,
+    ...recentMessages
+  ].slice(0, MAX_MESSAGES);
+  
+  console.log(`✅ Merged to ${result.length} messages`);
+  return result;
+}
 
 function estimateTokens(messages) {
   if (!messages) return 0;
@@ -28,63 +69,48 @@ async function tokenThrottle(messages) {
   const estimatedTokens = estimateTokens(messages);
   const now = Date.now();
   
-  // Clean up old entries (older than 1 minute)
   tokenUsageWindow = tokenUsageWindow.filter(entry => now - entry.timestamp < 60000);
-  
-  // Calculate tokens used in the last minute
   const tokensUsedLastMinute = tokenUsageWindow.reduce((sum, entry) => sum + entry.tokens, 0);
-  
-  // Calculate tokens used in the last second
   const tokensUsedLastSecond = tokenUsageWindow
     .filter(entry => now - entry.timestamp < 1000)
     .reduce((sum, entry) => sum + entry.tokens, 0);
   
   console.log(`📊 Token usage: ${tokensUsedLastMinute}/${MAX_TOKENS_PER_MINUTE} per min, ${tokensUsedLastSecond}/${MAX_TOKENS_PER_SECOND} per sec`);
   
-  // Check per-second limit
   if (tokensUsedLastSecond + estimatedTokens > MAX_TOKENS_PER_SECOND) {
-    const waitTime = 1000 - (now - tokenUsageWindow[tokenUsageWindow.length - 1]?.timestamp || now);
-    if (waitTime > 0) {
-      console.log(`⏳ Token throttle (tok/s): ${estimatedTokens} tokens would exceed ${MAX_TOKENS_PER_SECOND}/s. Waiting ${Math.round(waitTime)}ms...`);
-      await sleep(waitTime);
-    }
+    const waitTime = 1000;
+    console.log(`⏳ Token throttle (tok/s): Waiting ${waitTime}ms...`);
+    await sleep(waitTime);
   }
   
-  // Check per-minute limit
   if (tokensUsedLastMinute + estimatedTokens > MAX_TOKENS_PER_MINUTE) {
-    // Find when we'll have enough budget
     const oldestEntry = tokenUsageWindow[0];
     if (oldestEntry) {
       const waitTime = 60000 - (now - oldestEntry.timestamp);
       if (waitTime > 0 && waitTime < 60000) {
-        console.log(`⏳ Token throttle (tok/min): Budget exceeded. Waiting ${Math.round(waitTime/1000)}s...`);
+        console.log(`⏳ Token throttle (tok/min): Waiting ${Math.round(waitTime/1000)}s...`);
         await sleep(waitTime);
       }
     }
   }
   
-  // Record this request's token usage
   tokenUsageWindow.push({ timestamp: Date.now(), tokens: estimatedTokens });
-  
-  // Keep window manageable
   if (tokenUsageWindow.length > 1000) {
     tokenUsageWindow = tokenUsageWindow.slice(-500);
   }
 }
 
 // ===== CONSERVATIVE RATE LIMITING =====
-const MIN_DELAY = 5000; // 5 seconds minimum between requests
+const MIN_DELAY = 5000;
 let lastRequestTime = 0;
 let activeRequests = 0;
 
 async function rateLimit() {
-  // Wait if there's already an active request
   while (activeRequests >= 1) {
-    console.log(`⏳ Waiting for active request to complete...`);
+    console.log(`⏳ Waiting for active request...`);
     await sleep(1000);
   }
   
-  // Enforce minimum delay between requests
   const now = Date.now();
   const wait = MIN_DELAY - (now - lastRequestTime);
   if (wait > 0) {
@@ -97,7 +123,6 @@ async function rateLimit() {
 }
 
 // ===== RETRY CONFIGURATION =====
-// NO retries on 429
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY = 5000;
 
@@ -115,13 +140,11 @@ async function callWithRetry(fn, context = '') {
       
       const status = error.response?.status;
       
-      // NO RETRY on 429
       if (status === 429) {
         console.log(`🚫 429 Rate Limited - Not retrying.`);
         throw error;
       }
       
-      // Only retry on server errors (500, 503, 504)
       const isRetryable = status === 500 || status === 503 || status === 504;
       
       if (!isRetryable || attempt === MAX_RETRIES) {
@@ -141,7 +164,7 @@ async function callWithRetry(fn, context = '') {
       
       waitTime = Math.min(waitTime, 30000);
       
-      console.log(`⚠️ ${context} - Attempt ${attempt + 1}/${MAX_RETRIES + 1} (${status} server error). Waiting ${Math.round(waitTime/1000)}s...`);
+      console.log(`⚠️ ${context} - Attempt ${attempt + 1}/${MAX_RETRIES + 1} (${status}). Waiting ${Math.round(waitTime/1000)}s...`);
       await sleep(waitTime);
     }
   }
@@ -157,7 +180,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Model mapping - UNCHANGED
+// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'minimaxai/minimax-m3',
@@ -195,6 +218,7 @@ app.get('/health', (req, res) => {
     min_delay: `${MIN_DELAY/1000}s`,
     cooldown_remaining: `${Math.round(cooldownRemaining/1000)}s`,
     active_requests: activeRequests,
+    max_messages: MAX_MESSAGES,
     token_throttle: {
       max_per_second: MAX_TOKENS_PER_SECOND,
       max_per_minute: MAX_TOKENS_PER_MINUTE,
@@ -202,8 +226,7 @@ app.get('/health', (req, res) => {
       budget_remaining: Math.max(0, MAX_TOKENS_PER_MINUTE - tokensLastMinute)
     },
     retry_on_429: false,
-    retry_on_server_errors: '500, 503, 504',
-    strategy: 'token_aware_throttling'
+    strategy: 'message_merging'
   });
 });
 
@@ -230,26 +253,24 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
     const nimModel = resolveModel(model);
-    const tokenEstimate = estimateTokens(messages);
     
-    console.log(`📤 Request: ${messages.length} messages (~${tokenEstimate} tokens) → ${nimModel}`);
+    // WORKAROUND: Merge messages to stay under NVIDIA's 10 message limit
+    const processedMessages = mergeMessagesUnderLimit(messages);
+    const tokenEstimate = estimateTokens(processedMessages);
     
-    // Token-based throttling FIRST
-    await tokenThrottle(messages);
+    console.log(`📤 Request: ${messages.length}→${processedMessages.length} messages (~${tokenEstimate} tokens) → ${nimModel}`);
     
-    // Then request-based rate limiting
+    await tokenThrottle(processedMessages);
     await rateLimit();
     
-    // Prepare request - FULL CONTEXT, NO CHUNKING
     const nimRequest = {
       model: nimModel,
-      messages: messages,
+      messages: processedMessages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 4096,
       stream: stream || false
     };
     
-    // Make request with retry logic (NO retries on 429)
     const response = await callWithRetry(
       () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
         headers: {
@@ -307,12 +328,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     if (status === 429) {
       if (errorData?.message?.includes('cache')) {
-        console.log('💡 429 Cause: LoRA cache full');
+        console.log('💡 429: LoRA cache full');
       } else if (errorData?.message?.includes('queue')) {
-        console.log('💡 429 Cause: Request queue full');
+        console.log('💡 429: Queue full');
       } else {
-        console.log('💡 429 Cause: Token throughput limit (tok/s or tok/min)');
-        console.log('   Consider reducing MAX_TOKENS_PER_SECOND or MAX_TOKENS_PER_MINUTE');
+        console.log('💡 429: Token throughput limit');
       }
     }
     
@@ -335,15 +355,15 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NVIDIA NIM Proxy with Token-Aware Throttling`);
+  console.log(`🚀 NVIDIA NIM Proxy with Message Merging`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Triton queue: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
   console.log(`💾 Max CPU LoRAs: ${process.env.NIM_MAX_CPU_LORAS}`);
-  console.log(`🔢 Concurrent requests: 1 (sequential)`);
-  console.log(`⏱️ Min delay: ${MIN_DELAY/1000}s between requests`);
+  console.log(`🔢 Concurrent requests: 1`);
+  console.log(`⏱️ Min delay: ${MIN_DELAY/1000}s`);
+  console.log(`📝 Message limit: ${MAX_MESSAGES} (older merged into summary)`);
   console.log(`🪙 Token limit: ${MAX_TOKENS_PER_SECOND}/s, ${MAX_TOKENS_PER_MINUTE}/min`);
-  console.log(`🔄 Retries: ${MAX_RETRIES} (for 500/503/504 only - NO retries on 429)`);
-  console.log(`📝 Full context preserved - NO chunking`);
-  console.log(`💡 Strategy: Token-aware throttling + request pacing`);
+  console.log(`🔄 Retries: ${MAX_RETRIES} (500/503/504 only)`);
+  console.log(`💡 Strategy: Merge messages + token throttle + request pacing`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
 });
