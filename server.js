@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy with Full 429 Protection
+// server.js - NVIDIA NIM Proxy with Token-Based Throttling
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -7,23 +7,79 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ===== NVIDIA TRITON & LORA CONFIGURATION =====
-// Based on NVIDIA's own recommendations for avoiding 429 errors
 process.env.NIM_TRITON_MAX_QUEUE_SIZE = process.env.NIM_TRITON_MAX_QUEUE_SIZE || '500';
 process.env.NIM_TRITON_MAX_BATCH_SIZE = process.env.NIM_TRITON_MAX_BATCH_SIZE || '16';
 process.env.NIM_TRITON_MIN_WORKERS = process.env.NIM_TRITON_MIN_WORKERS || '1';
 process.env.NIM_TRITON_MAX_WORKERS = process.env.NIM_TRITON_MAX_WORKERS || '4';
-// NEW: LoRA cache management to prevent "cache full" 429 errors
 process.env.NIM_MAX_CPU_LORAS = process.env.NIM_MAX_CPU_LORAS || '10';
 
-// ===== CONSERVATIVE RATE LIMITING (NVIDIA-style: 1 at a time) =====
-const MIN_DELAY = 10000; // 10 seconds between requests (like NV_INGEST_FILES_PER_BATCH=1)
-const CONCURRENT_REQUESTS = 1; // Only 1 at a time (like NV_INGEST_CONCURRENT_BATCHES=1)
+// ===== TOKEN-BASED THROTTLING =====
+// NVIDIA free tier likely has a token/second limit
+const MAX_TOKENS_PER_SECOND = 17;    // Adjust based on your tier
+const MAX_TOKENS_PER_MINUTE = 1000000;  // Total token budget per minute
+let tokenUsageWindow = [];           // Track token usage timestamps
+
+function estimateTokens(messages) {
+  if (!messages) return 0;
+  return Math.ceil(JSON.stringify(messages).length / 4);
+}
+
+async function tokenThrottle(messages) {
+  const estimatedTokens = estimateTokens(messages);
+  const now = Date.now();
+  
+  // Clean up old entries (older than 1 minute)
+  tokenUsageWindow = tokenUsageWindow.filter(entry => now - entry.timestamp < 60000);
+  
+  // Calculate tokens used in the last minute
+  const tokensUsedLastMinute = tokenUsageWindow.reduce((sum, entry) => sum + entry.tokens, 0);
+  
+  // Calculate tokens used in the last second
+  const tokensUsedLastSecond = tokenUsageWindow
+    .filter(entry => now - entry.timestamp < 1000)
+    .reduce((sum, entry) => sum + entry.tokens, 0);
+  
+  console.log(`📊 Token usage: ${tokensUsedLastMinute}/${MAX_TOKENS_PER_MINUTE} per min, ${tokensUsedLastSecond}/${MAX_TOKENS_PER_SECOND} per sec`);
+  
+  // Check per-second limit
+  if (tokensUsedLastSecond + estimatedTokens > MAX_TOKENS_PER_SECOND) {
+    const waitTime = 1000 - (now - tokenUsageWindow[tokenUsageWindow.length - 1]?.timestamp || now);
+    if (waitTime > 0) {
+      console.log(`⏳ Token throttle (tok/s): ${estimatedTokens} tokens would exceed ${MAX_TOKENS_PER_SECOND}/s. Waiting ${Math.round(waitTime)}ms...`);
+      await sleep(waitTime);
+    }
+  }
+  
+  // Check per-minute limit
+  if (tokensUsedLastMinute + estimatedTokens > MAX_TOKENS_PER_MINUTE) {
+    // Find when we'll have enough budget
+    const oldestEntry = tokenUsageWindow[0];
+    if (oldestEntry) {
+      const waitTime = 60000 - (now - oldestEntry.timestamp);
+      if (waitTime > 0 && waitTime < 60000) {
+        console.log(`⏳ Token throttle (tok/min): Budget exceeded. Waiting ${Math.round(waitTime/1000)}s...`);
+        await sleep(waitTime);
+      }
+    }
+  }
+  
+  // Record this request's token usage
+  tokenUsageWindow.push({ timestamp: Date.now(), tokens: estimatedTokens });
+  
+  // Keep window manageable
+  if (tokenUsageWindow.length > 1000) {
+    tokenUsageWindow = tokenUsageWindow.slice(-500);
+  }
+}
+
+// ===== CONSERVATIVE RATE LIMITING =====
+const MIN_DELAY = 5000; // 5 seconds minimum between requests
 let lastRequestTime = 0;
 let activeRequests = 0;
 
 async function rateLimit() {
   // Wait if there's already an active request
-  while (activeRequests >= CONCURRENT_REQUESTS) {
+  while (activeRequests >= 1) {
     console.log(`⏳ Waiting for active request to complete...`);
     await sleep(1000);
   }
@@ -32,7 +88,7 @@ async function rateLimit() {
   const now = Date.now();
   const wait = MIN_DELAY - (now - lastRequestTime);
   if (wait > 0) {
-    console.log(`⏳ Rate limit cooldown: ${Math.round(wait/1000)}s...`);
+    console.log(`⏳ Request cooldown: ${Math.round(wait/1000)}s...`);
     await sleep(wait);
   }
   
@@ -41,10 +97,9 @@ async function rateLimit() {
 }
 
 // ===== RETRY CONFIGURATION =====
-// NO retries on 429 - let Triton queue handle it
-// Retries only on server errors (503, 504, 500)
+// NO retries on 429
 const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY = 5000; // 5 second base delay for server errors
+const RETRY_BASE_DELAY = 5000;
 
 // ===== HELPERS =====
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -60,9 +115,9 @@ async function callWithRetry(fn, context = '') {
       
       const status = error.response?.status;
       
-      // NO RETRY on 429 - return immediately
+      // NO RETRY on 429
       if (status === 429) {
-        console.log(`🚫 429 Rate Limited - Not retrying. Let Triton queue handle it.`);
+        console.log(`🚫 429 Rate Limited - Not retrying.`);
         throw error;
       }
       
@@ -73,7 +128,6 @@ async function callWithRetry(fn, context = '') {
         throw error;
       }
       
-      // Use Retry-After header if available
       let waitTime;
       const retryAfter = error.response?.headers?.['retry-after'];
       
@@ -81,12 +135,10 @@ async function callWithRetry(fn, context = '') {
         waitTime = parseInt(retryAfter) * 1000;
         console.log(`⚠️ Server says retry after ${retryAfter}s`);
       } else {
-        // Exponential backoff for server errors
         waitTime = RETRY_BASE_DELAY * Math.pow(2, attempt);
-        waitTime = waitTime * (0.8 + Math.random() * 0.4); // Add jitter
+        waitTime = waitTime * (0.8 + Math.random() * 0.4);
       }
       
-      // Cap at 30 seconds for server errors
       waitTime = Math.min(waitTime, 30000);
       
       console.log(`⚠️ ${context} - Attempt ${attempt + 1}/${MAX_RETRIES + 1} (${status} server error). Waiting ${Math.round(waitTime/1000)}s...`);
@@ -105,7 +157,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Model mapping - UNCHANGED as requested
+// Model mapping - UNCHANGED
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'minimaxai/minimax-m3',
@@ -132,21 +184,26 @@ function resolveModel(model) {
 app.get('/health', (req, res) => {
   const now = Date.now();
   const cooldownRemaining = Math.max(0, MIN_DELAY - (now - lastRequestTime));
+  const tokensLastMinute = tokenUsageWindow
+    .filter(entry => now - entry.timestamp < 60000)
+    .reduce((sum, entry) => sum + entry.tokens, 0);
   
   res.json({
     status: 'ok',
     triton_queue_size: process.env.NIM_TRITON_MAX_QUEUE_SIZE,
-    triton_batch_size: process.env.NIM_TRITON_MAX_BATCH_SIZE,
-    triton_workers: `${process.env.NIM_TRITON_MIN_WORKERS}-${process.env.NIM_TRITON_MAX_WORKERS}`,
     max_cpu_loras: process.env.NIM_MAX_CPU_LORAS,
     min_delay: `${MIN_DELAY/1000}s`,
     cooldown_remaining: `${Math.round(cooldownRemaining/1000)}s`,
     active_requests: activeRequests,
-    max_concurrent: CONCURRENT_REQUESTS,
-    max_retries: MAX_RETRIES,
+    token_throttle: {
+      max_per_second: MAX_TOKENS_PER_SECOND,
+      max_per_minute: MAX_TOKENS_PER_MINUTE,
+      used_last_minute: tokensLastMinute,
+      budget_remaining: Math.max(0, MAX_TOKENS_PER_MINUTE - tokensLastMinute)
+    },
     retry_on_429: false,
     retry_on_server_errors: '500, 503, 504',
-    strategy: 'nvidia_conservative_no_429_retry'
+    strategy: 'token_aware_throttling'
   });
 });
 
@@ -173,8 +230,15 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
     const nimModel = resolveModel(model);
+    const tokenEstimate = estimateTokens(messages);
     
-    console.log(`📤 Request: ${messages.length} messages → ${nimModel} (active: ${activeRequests})`);
+    console.log(`📤 Request: ${messages.length} messages (~${tokenEstimate} tokens) → ${nimModel}`);
+    
+    // Token-based throttling FIRST
+    await tokenThrottle(messages);
+    
+    // Then request-based rate limiting
+    await rateLimit();
     
     // Prepare request - FULL CONTEXT, NO CHUNKING
     const nimRequest = {
@@ -185,9 +249,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // NVIDIA-style: 1 request at a time with minimum delay
-    await rateLimit();
-    
     // Make request with retry logic (NO retries on 429)
     const response = await callWithRetry(
       () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
@@ -196,7 +257,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'Content-Type': 'application/json'
         },
         responseType: stream ? 'stream' : 'json',
-        timeout: 180000 // 3 minute timeout for queued requests
+        timeout: 180000
       }),
       nimModel
     );
@@ -229,7 +290,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           message: { role: 'assistant', content },
           finish_reason: response.data.choices[0]?.finish_reason || 'stop'
         }],
-        usage: response.data.usage || {}
+        usage: response.data.usage || {
+          prompt_tokens: tokenEstimate,
+          completion_tokens: estimateTokens(content),
+          total_tokens: tokenEstimate + estimateTokens(content)
+        }
       });
     }
     
@@ -241,15 +306,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     const errorData = error.response?.data;
     
     if (status === 429) {
-      // Detect specific 429 causes based on NVIDIA documentation
       if (errorData?.message?.includes('cache')) {
-        console.log('💡 429 Cause: LoRA cache full (NIM_MAX_CPU_LORAS)');
+        console.log('💡 429 Cause: LoRA cache full');
       } else if (errorData?.message?.includes('queue')) {
-        console.log('💡 429 Cause: Request queue full (NIM_TRITON_MAX_QUEUE_SIZE)');
+        console.log('💡 429 Cause: Request queue full');
       } else {
-        console.log('💡 429 Cause: General rate limiting');
+        console.log('💡 429 Cause: Token throughput limit (tok/s or tok/min)');
+        console.log('   Consider reducing MAX_TOKENS_PER_SECOND or MAX_TOKENS_PER_MINUTE');
       }
-      console.log('🚫 Not retrying - let Triton queue handle it');
     }
     
     res.status(status).json({
@@ -271,16 +335,15 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NVIDIA NIM Proxy with 429 Protection`);
+  console.log(`🚀 NVIDIA NIM Proxy with Token-Aware Throttling`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Triton queue: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
-  console.log(`📊 Triton batch: ${process.env.NIM_TRITON_MAX_BATCH_SIZE}`);
-  console.log(`👷 Triton workers: ${process.env.NIM_TRITON_MIN_WORKERS}-${process.env.NIM_TRITON_MAX_WORKERS}`);
   console.log(`💾 Max CPU LoRAs: ${process.env.NIM_MAX_CPU_LORAS}`);
-  console.log(`🔢 Concurrent requests: ${CONCURRENT_REQUESTS} (sequential)`);
+  console.log(`🔢 Concurrent requests: 1 (sequential)`);
   console.log(`⏱️ Min delay: ${MIN_DELAY/1000}s between requests`);
+  console.log(`🪙 Token limit: ${MAX_TOKENS_PER_SECOND}/s, ${MAX_TOKENS_PER_MINUTE}/min`);
   console.log(`🔄 Retries: ${MAX_RETRIES} (for 500/503/504 only - NO retries on 429)`);
   console.log(`📝 Full context preserved - NO chunking`);
-  console.log(`💡 Strategy: NVIDIA-style conservative (1 at a time)`);
+  console.log(`💡 Strategy: Token-aware throttling + request pacing`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
 });
