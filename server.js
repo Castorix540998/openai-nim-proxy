@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy with Message Merging
+// server.js - NVIDIA NIM Proxy with Detailed 429 Diagnostics
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -13,52 +13,13 @@ process.env.NIM_TRITON_MIN_WORKERS = process.env.NIM_TRITON_MIN_WORKERS || '1';
 process.env.NIM_TRITON_MAX_WORKERS = process.env.NIM_TRITON_MAX_WORKERS || '4';
 process.env.NIM_MAX_CPU_LORAS = process.env.NIM_MAX_CPU_LORAS || '10';
 
-// ===== MESSAGE COUNT LIMIT WORKAROUND =====
-const MAX_MESSAGES = 10; // NVIDIA's limit
+// ===== TOKEN-BASED THROTTLING =====
 const MAX_TOKENS_PER_SECOND = 50;
 const MAX_TOKENS_PER_MINUTE = 2000;
 let tokenUsageWindow = [];
 
-// Merge older messages to stay under the 10 message limit
-function mergeMessagesUnderLimit(messages) {
-  if (!messages || messages.length <= MAX_MESSAGES) {
-    return messages;
-  }
-  
-  console.log(`🔧 Merging ${messages.length} messages to fit ${MAX_MESSAGES} limit...`);
-  
-  const systemMessages = messages.filter(m => m.role === 'system');
-  const nonSystemMessages = messages.filter(m => m.role !== 'system');
-  
-  // Keep last 8 messages intact (4 exchanges)
-  const recentMessages = nonSystemMessages.slice(-8);
-  const olderMessages = nonSystemMessages.slice(0, -8);
-  
-  if (olderMessages.length === 0) {
-    // Just truncate to last 10
-    return [...systemMessages.slice(0, 1), ...nonSystemMessages.slice(-9)];
-  }
-  
-  // Merge all older messages into a single system message
-  const mergedContent = olderMessages
-    .map(m => `${m.role}: ${m.content.substring(0, 200)}`)
-    .join('\n');
-  
-  const summaryMessage = {
-    role: 'system',
-    content: `[Earlier conversation:\n${mergedContent.substring(0, 1000)}\n---\nContinue the conversation naturally.]`
-  };
-  
-  // Combine: 1 system + 1 summary + 8 recent = 10 messages total
-  const result = [
-    ...systemMessages.slice(0, 1),
-    summaryMessage,
-    ...recentMessages
-  ].slice(0, MAX_MESSAGES);
-  
-  console.log(`✅ Merged to ${result.length} messages`);
-  return result;
-}
+// ===== DETAILED 429 LOGGING =====
+let last429Error = null;
 
 function estimateTokens(messages) {
   if (!messages) return 0;
@@ -141,7 +102,69 @@ async function callWithRetry(fn, context = '') {
       const status = error.response?.status;
       
       if (status === 429) {
-        console.log(`🚫 429 Rate Limited - Not retrying.`);
+        // CAPTURE DETAILED 429 INFORMATION
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`🚫 429 RATE LIMIT ERROR - DETAILED DIAGNOSTICS`);
+        console.log(`${'='.repeat(60)}`);
+        
+        // Response body
+        if (error.response?.data) {
+          console.log(`📦 Response Body:`);
+          console.log(JSON.stringify(error.response.data, null, 2));
+        }
+        
+        // Response headers
+        if (error.response?.headers) {
+          console.log(`\n📋 Response Headers:`);
+          Object.entries(error.response.headers).forEach(([key, value]) => {
+            console.log(`   ${key}: ${value}`);
+          });
+        }
+        
+        // Analyze the error
+        const errorData = error.response?.data;
+        const errorHeaders = error.response?.headers || {};
+        
+        console.log(`\n🔍 Analysis:`);
+        
+        if (errorData?.message?.toLowerCase().includes('cache')) {
+          console.log(`   ⚠️ LoRA cache is full - too many different models active`);
+          console.log(`   💡 Fix: Increase NIM_MAX_CPU_LORAS or use fewer model variants`);
+        }
+        
+        if (errorData?.message?.toLowerCase().includes('queue')) {
+          console.log(`   ⚠️ Request queue is full - too many pending requests`);
+          console.log(`   💡 Fix: Increase NIM_TRITON_MAX_QUEUE_SIZE or slow down requests`);
+        }
+        
+        if (errorData?.message?.toLowerCase().includes('token') || 
+            errorData?.message?.toLowerCase().includes('rate')) {
+          console.log(`   ⚠️ Token throughput limit exceeded`);
+          console.log(`   💡 Fix: Reduce MAX_TOKENS_PER_SECOND or MAX_TOKENS_PER_MINUTE`);
+        }
+        
+        if (errorHeaders['retry-after']) {
+          console.log(`   ⏱️ Retry-After: ${errorHeaders['retry-after']} seconds`);
+        }
+        
+        if (errorHeaders['x-ratelimit-remaining']) {
+          console.log(`   📊 Rate limit remaining: ${errorHeaders['x-ratelimit-remaining']}`);
+          console.log(`   📊 Rate limit total: ${errorHeaders['x-ratelimit-limit']}`);
+          console.log(`   📊 Rate limit reset: ${errorHeaders['x-ratelimit-reset']}`);
+        }
+        
+        // Store for health endpoint
+        last429Error = {
+          timestamp: new Date().toISOString(),
+          status: error.response?.status,
+          data: error.response?.data,
+          headers: error.response?.headers,
+          messageCount: context?.messages || 'unknown',
+          tokenEstimate: context?.tokens || 'unknown'
+        };
+        
+        console.log(`${'='.repeat(60)}\n`);
+        console.log(`🚫 Not retrying - returning 429 to client`);
         throw error;
       }
       
@@ -218,15 +241,29 @@ app.get('/health', (req, res) => {
     min_delay: `${MIN_DELAY/1000}s`,
     cooldown_remaining: `${Math.round(cooldownRemaining/1000)}s`,
     active_requests: activeRequests,
-    max_messages: MAX_MESSAGES,
     token_throttle: {
       max_per_second: MAX_TOKENS_PER_SECOND,
       max_per_minute: MAX_TOKENS_PER_MINUTE,
       used_last_minute: tokensLastMinute,
       budget_remaining: Math.max(0, MAX_TOKENS_PER_MINUTE - tokensLastMinute)
     },
+    last_429_error: last429Error,
     retry_on_429: false,
-    strategy: 'message_merging'
+    strategy: 'full_diagnostics'
+  });
+});
+
+// Dedicated 429 diagnostics endpoint
+app.get('/debug/429', (req, res) => {
+  res.json({
+    last_429_error: last429Error,
+    current_config: {
+      NIM_TRITON_MAX_QUEUE_SIZE: process.env.NIM_TRITON_MAX_QUEUE_SIZE,
+      NIM_MAX_CPU_LORAS: process.env.NIM_MAX_CPU_LORAS,
+      MAX_TOKENS_PER_SECOND: MAX_TOKENS_PER_SECOND,
+      MAX_TOKENS_PER_MINUTE: MAX_TOKENS_PER_MINUTE,
+      MIN_DELAY: `${MIN_DELAY/1000}s`
+    }
   });
 });
 
@@ -253,19 +290,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
     const nimModel = resolveModel(model);
+    const tokenEstimate = estimateTokens(messages);
     
-    // WORKAROUND: Merge messages to stay under NVIDIA's 10 message limit
-    const processedMessages = mergeMessagesUnderLimit(messages);
-    const tokenEstimate = estimateTokens(processedMessages);
+    console.log(`📤 Request: ${messages.length} messages (~${tokenEstimate} tokens) → ${nimModel}`);
     
-    console.log(`📤 Request: ${messages.length}→${processedMessages.length} messages (~${tokenEstimate} tokens) → ${nimModel}`);
-    
-    await tokenThrottle(processedMessages);
+    await tokenThrottle(messages);
     await rateLimit();
     
+    // Prepare request - FULL CONTEXT, NO MESSAGE MERGING
     const nimRequest = {
       model: nimModel,
-      messages: processedMessages,
+      messages: messages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 4096,
       stream: stream || false
@@ -280,7 +315,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         responseType: stream ? 'stream' : 'json',
         timeout: 180000
       }),
-      nimModel
+      `${nimModel} (msgs: ${messages.length}, tokens: ~${tokenEstimate})`
     );
     
     activeRequests--;
@@ -324,17 +359,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('❌ Error:', error.message);
     
     const status = error.response?.status || 500;
-    const errorData = error.response?.data;
-    
-    if (status === 429) {
-      if (errorData?.message?.includes('cache')) {
-        console.log('💡 429: LoRA cache full');
-      } else if (errorData?.message?.includes('queue')) {
-        console.log('💡 429: Queue full');
-      } else {
-        console.log('💡 429: Token throughput limit');
-      }
-    }
     
     res.status(status).json({
       error: {
@@ -355,15 +379,16 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NVIDIA NIM Proxy with Message Merging`);
+  console.log(`🚀 NVIDIA NIM Proxy with Full 429 Diagnostics`);
   console.log(`📡 Port: ${PORT}`);
+  console.log(`🔍 Debug endpoint: http://localhost:${PORT}/debug/429`);
   console.log(`📋 Triton queue: ${process.env.NIM_TRITON_MAX_QUEUE_SIZE}`);
   console.log(`💾 Max CPU LoRAs: ${process.env.NIM_MAX_CPU_LORAS}`);
   console.log(`🔢 Concurrent requests: 1`);
   console.log(`⏱️ Min delay: ${MIN_DELAY/1000}s`);
-  console.log(`📝 Message limit: ${MAX_MESSAGES} (older merged into summary)`);
   console.log(`🪙 Token limit: ${MAX_TOKENS_PER_SECOND}/s, ${MAX_TOKENS_PER_MINUTE}/min`);
-  console.log(`🔄 Retries: ${MAX_RETRIES} (500/503/504 only)`);
-  console.log(`💡 Strategy: Merge messages + token throttle + request pacing`);
+  console.log(`🔄 Retries: ${MAX_RETRIES} (500/503/504 only - NO retries on 429)`);
+  console.log(`📝 Full context preserved - NO message merging`);
+  console.log(`💡 Strategy: Token throttle + request pacing + full 429 diagnostics`);
   console.log(`🔑 API Base: ${NIM_API_BASE}`);
 });
