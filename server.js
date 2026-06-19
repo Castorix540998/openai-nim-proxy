@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - 10 Request Batches with 15min Cooldown
+// server.js - NVIDIA NIM Proxy - 11 Request Batches with 15min Cooldown
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -18,8 +18,9 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const MODEL_PRO = 'deepseek-ai/deepseek-v4-pro';
 const MODEL_FLASH = 'deepseek-ai/deepseek-v4-flash';
 
-// ===== BATCH SYSTEM: 10 requests per model, then 15 minute cooldown =====
-const MAX_REQUESTS_PER_BATCH = 10;
+// ===== BATCH SYSTEM: 11 requests per model, then 15 minute cooldown =====
+// The 11th request is expected to hit 429, triggering the cooldown
+const MAX_REQUESTS_PER_BATCH = 11;
 const COOLDOWN_MINUTES = 15;
 const COOLDOWN_MS = COOLDOWN_MINUTES * 60 * 1000;
 
@@ -61,11 +62,12 @@ function getActiveModel() {
   }
   
   // Check if current model has reached its limit
+  // At 11 requests, we allow it through knowing it will 429
   if (current.requestsUsed >= MAX_REQUESTS_PER_BATCH) {
     // Put current model on cooldown
     current.cooldownUntil = now + COOLDOWN_MS;
     current.requestsUsed = 0;
-    console.log(`🔒 ${current.name}: 10 requests used - COOLDOWN for ${COOLDOWN_MINUTES} minutes (until ${new Date(current.cooldownUntil).toLocaleTimeString()})`);
+    console.log(`🔒 ${current.name}: ${MAX_REQUESTS_PER_BATCH} requests used - COOLDOWN for ${COOLDOWN_MINUTES} minutes (until ${new Date(current.cooldownUntil).toLocaleTimeString()})`);
     
     // Switch to other model
     const otherModel = activeModel === MODEL_PRO ? MODEL_FLASH : MODEL_PRO;
@@ -91,7 +93,11 @@ function getActiveModel() {
 function incrementRequestCount(model) {
   modelState[model].requestsUsed++;
   const remaining = MAX_REQUESTS_PER_BATCH - modelState[model].requestsUsed;
-  console.log(`📊 ${modelState[model].name}: ${modelState[model].requestsUsed}/${MAX_REQUESTS_PER_BATCH} requests used (${remaining} remaining)`);
+  if (modelState[model].requestsUsed >= MAX_REQUESTS_PER_BATCH) {
+    console.log(`📊 ${modelState[model].name}: ${modelState[model].requestsUsed}/${MAX_REQUESTS_PER_BATCH} requests used (FINAL - 429 expected on this request)`);
+  } else {
+    console.log(`📊 ${modelState[model].name}: ${modelState[model].requestsUsed}/${MAX_REQUESTS_PER_BATCH} requests used (${remaining} remaining)`);
+  }
 }
 
 function forceCooldown(model) {
@@ -104,9 +110,9 @@ function forceCooldown(model) {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ===== RETRY CONFIGURATION =====
-// NO retries on 429
+// NO retries on 429 - it's expected on the 11th request
 // Retries allowed on 500, 503, 504
-const MAX_RETRIES = 5; // More retries for server errors since they're usually temporary
+const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY = 3000;
 
 async function callWithRetry(fn, model) {
@@ -121,9 +127,11 @@ async function callWithRetry(fn, model) {
       const status = error.response?.status;
       
       // ===== 429 HANDLING: NO RETRIES, FORCE COOLDOWN =====
+      // This is expected on the 11th request
       if (status === 429) {
         console.log(`\n${'='.repeat(60)}`);
         console.log(`🚫 429 RATE LIMIT on ${modelState[model]?.name || model}`);
+        console.log(`   (${modelState[model]?.requestsUsed}/${MAX_REQUESTS_PER_BATCH} requests - 429 was expected on the ${MAX_REQUESTS_PER_BATCH}th)`);
         console.log(`${'='.repeat(60)}`);
         
         if (error.response?.data) {
@@ -195,20 +203,23 @@ app.get('/health', (req, res) => {
       requests_remaining: MAX_REQUESTS_PER_BATCH - proState.requestsUsed,
       on_cooldown: now < proState.cooldownUntil,
       cooldown_remaining: proCooldownRemaining > 0 ? `${Math.ceil(proCooldownRemaining / 1000)}s (${Math.ceil(proCooldownRemaining / 60000)} minutes)` : 'none',
-      available: now >= proState.cooldownUntil && proState.requestsUsed < MAX_REQUESTS_PER_BATCH
+      available: now >= proState.cooldownUntil && proState.requestsUsed < MAX_REQUESTS_PER_BATCH,
+      note: proState.requestsUsed >= MAX_REQUESTS_PER_BATCH ? '429 expected on next request' : null
     },
     deepseek_v4_flash: {
       requests_used: `${flashState.requestsUsed}/${MAX_REQUESTS_PER_BATCH}`,
       requests_remaining: MAX_REQUESTS_PER_BATCH - flashState.requestsUsed,
       on_cooldown: now < flashState.cooldownUntil,
       cooldown_remaining: flashCooldownRemaining > 0 ? `${Math.ceil(flashCooldownRemaining / 1000)}s (${Math.ceil(flashCooldownRemaining / 60000)} minutes)` : 'none',
-      available: now >= flashState.cooldownUntil && flashState.requestsUsed < MAX_REQUESTS_PER_BATCH
+      available: now >= flashState.cooldownUntil && flashState.requestsUsed < MAX_REQUESTS_PER_BATCH,
+      note: flashState.requestsUsed >= MAX_REQUESTS_PER_BATCH ? '429 expected on next request' : null
     },
     system: {
       batch_size: MAX_REQUESTS_PER_BATCH,
       cooldown_minutes: COOLDOWN_MINUTES,
+      description: `11 requests allowed per model. 11th request triggers 429 → cooldown → switch model`,
       retry_policy: {
-        on_429: 'NO RETRIES - Immediate 15 minute cooldown',
+        on_429: 'NO RETRIES - Expected on 11th request - Immediate 15 minute cooldown',
         on_500_503_504: `Up to ${MAX_RETRIES} retries with exponential backoff`
       }
     }
@@ -236,7 +247,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
     }
     
-    // Get the active model (respects 10-request batches and cooldowns)
+    // Get the active model (respects 11-request batches and cooldowns)
     const nimModel = getActiveModel();
     
     // If no model is available (both on cooldown)
@@ -252,7 +263,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const minutesRemaining = Math.ceil(minRemaining / 60000);
       const secondsRemaining = Math.ceil(minRemaining / 1000);
       
-      console.log(`🚫 Both models on cooldown! Rejecting request.`);
+      console.log(`🚫 Both models on cooldown! Rejecting request BEFORE reaching NVIDIA.`);
       
       return res.status(429).json({
         error: {
@@ -268,7 +279,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
     }
     
-    console.log(`📤 ${messages.length} messages → ${modelState[nimModel].name} (${modelState[nimModel].requestsUsed + 1}/${MAX_REQUESTS_PER_BATCH})`);
+    const isEleventhRequest = modelState[nimModel].requestsUsed >= MAX_REQUESTS_PER_BATCH - 1;
+    
+    if (isEleventhRequest) {
+      console.log(`📤 ${messages.length} messages → ${modelState[nimModel].name} (${modelState[nimModel].requestsUsed + 1}/${MAX_REQUESTS_PER_BATCH} - 429 EXPECTED)`);
+    } else {
+      console.log(`📤 ${messages.length} messages → ${modelState[nimModel].name} (${modelState[nimModel].requestsUsed + 1}/${MAX_REQUESTS_PER_BATCH})`);
+    }
     
     // Increment the request counter BEFORE making the request
     incrementRequestCount(nimModel);
@@ -344,13 +361,14 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - 10 Request Batches with 15min Cooldown`);
+  console.log(`🚀 NIM Proxy - 11 Request Batches with 15min Cooldown`);
   console.log(`📡 Port: ${PORT}`);
-  console.log(`🔢 Batch size: ${MAX_REQUESTS_PER_BATCH} requests per model`);
+  console.log(`🔢 Batch size: ${MAX_REQUESTS_PER_BATCH} requests per model (11th hits 429)`);
   console.log(`🔒 Cooldown: ${COOLDOWN_MINUTES} minutes after ${MAX_REQUESTS_PER_BATCH} requests`);
-  console.log(`🔄 Pattern: Pro (10) → Flash (10) → Pro (10) → Flash (10)...`);
-  console.log(`🚫 429 Policy: NO RETRIES - Immediate 15 minute cooldown`);
+  console.log(`🔄 Pattern: Pro (11) → 429 → cooldown → Flash (11) → 429 → cooldown → Pro...`);
+  console.log(`🚫 429 Policy: NO RETRIES - Expected on 11th request - 15min cooldown`);
   console.log(`⚠️ 500/503/504 Policy: Up to ${MAX_RETRIES} retries with backoff`);
+  console.log(`🛡️ Cooldown models blocked BEFORE reaching NVIDIA`);
   console.log(`📝 Full context - NO truncation, NO token limits`);
   console.log(`💡 Health check: /health`);
 });
