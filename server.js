@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - 3 Model Rotation (Retries Count)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Simple)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -14,188 +14,114 @@ process.env.NIM_MAX_CPU_LORAS = process.env.NIM_MAX_CPU_LORAS || '10';
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// ===== MODEL CONFIGURATION =====
-const MODEL_PRO = 'deepseek-ai/deepseek-v4-pro';
-const MODEL_FLASH = 'deepseek-ai/deepseek-v4-flash';
-const MODEL_GLM = 'z-ai/glm-5.1';
-
-// ===== BATCH SYSTEM =====
-const COOLDOWN_MINUTES = 60;
-const COOLDOWN_MS = COOLDOWN_MINUTES * 60 * 1000;
-
-// Track each model's usage and limits
-const modelState = {
-  [MODEL_PRO]: {
-    requestsUsed: 0,
-    cooldownUntil: 0,
-    name: 'DeepSeek V4 Pro',
-    maxRequests: 10,
-    retriesAllowed: 1  // 1 retry = 2 total attempts per request slot
-  },
-  [MODEL_FLASH]: {
-    requestsUsed: 0,
-    cooldownUntil: 0,
-    name: 'DeepSeek V4 Flash',
-    maxRequests: 10,
-    retriesAllowed: 1  // 1 retry = 2 total attempts per request slot
-  },
-  [MODEL_GLM]: {
-    requestsUsed: 0,
-    cooldownUntil: 0,
-    name: 'GLM 5.1',
-    maxRequests: 30,
-    retriesAllowed: 2  // 2 retries = 3 total attempts per request slot
-  }
+// ===== MODEL MAPPING - FULL LIST =====
+const MODEL_MAPPING = {
+  'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
+  'gpt-4': 'minimaxai/minimax-m3',
+  'gpt-4-turbo': 'moonshotai/kimi-k2.6',
+  'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
+  'claude-3-opus': 'z-ai/glm-5.1',
+  'claude-3-sonnet': 'mistralai/mistral-medium-3.5-128b',
+  'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b'
 };
 
-// ===== SEQUENCE =====
-// Each slot in the sequence represents one "request slot"
-// A request slot may consume 1-N attempts depending on retries
-const sequence = [
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  MODEL_PRO, MODEL_GLM,
-  MODEL_FLASH, MODEL_GLM,
-  // GLM solo until its 30 are used
-  MODEL_GLM, MODEL_GLM, MODEL_GLM, MODEL_GLM, MODEL_GLM,
-  MODEL_GLM, MODEL_GLM, MODEL_GLM, MODEL_GLM, MODEL_GLM,
-  MODEL_GLM
-];
+function resolveModel(openaiModel) {
+  return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4-flash';
+}
 
-let sequenceIndex = 0;
+// ===== RATE LIMITING =====
+const MIN_DELAY = 3000; // 3 seconds between requests
+let lastRequestTime = 0;
+let activeRequests = 0;
 
-function getNextModelInSequence() {
+async function rateLimit() {
+  while (activeRequests >= 1) {
+    await sleep(500);
+  }
+  
   const now = Date.now();
-  
-  // Check if all models are available (cooldowns expired and counters reset)
-  const allAvailable = Object.values(modelState).every(state => {
-    if (now < state.cooldownUntil) return false;
-    if (state.requestsUsed >= state.maxRequests && now >= state.cooldownUntil) {
-      // Reset counter if cooldown has expired
-      state.requestsUsed = 0;
-    }
-    return state.requestsUsed < state.maxRequests;
-  });
-  
-  // If all are fresh, restart sequence from beginning
-  if (allAvailable && sequenceIndex >= sequence.length) {
-    console.log(`🔄 All models available! Restarting sequence from beginning.`);
-    sequenceIndex = 0;
+  const wait = MIN_DELAY - (now - lastRequestTime);
+  if (wait > 0) {
+    console.log(`⏳ Cooldown: ${Math.round(wait/1000)}s...`);
+    await sleep(wait);
   }
   
-  // Try to find the next available model in sequence
-  for (let i = 0; i < sequence.length; i++) {
-    const modelIndex = (sequenceIndex + i) % sequence.length;
-    const model = sequence[modelIndex];
-    const state = modelState[model];
-    
-    // Check if model is on cooldown
-    if (now < state.cooldownUntil) {
-      continue; // Skip, on cooldown
-    }
-    
-    // Check if model has requests remaining
-    if (state.requestsUsed >= state.maxRequests) {
-      continue; // Skip, no requests left
-    }
-    
-    // Found an available model
-    sequenceIndex = (modelIndex + 1) % sequence.length; // Point to next for future
-    return model;
-  }
-  
-  // No model available
-  return null;
-}
-
-function consumeRequestSlot(model) {
-  modelState[model].requestsUsed++;
-  const state = modelState[model];
-  const remaining = state.maxRequests - state.requestsUsed;
-  
-  if (state.requestsUsed >= state.maxRequests) {
-    // Put model on cooldown
-    state.cooldownUntil = Date.now() + COOLDOWN_MS;
-    console.log(`🔒 ${state.name}: ${state.requestsUsed}/${state.maxRequests} slots used - COOLDOWN for ${COOLDOWN_MINUTES} minutes (until ${new Date(state.cooldownUntil).toLocaleTimeString()})`);
-  } else {
-    console.log(`📊 ${state.name}: ${state.requestsUsed}/${state.maxRequests} slots used (${remaining} remaining)`);
-  }
-}
-
-function forceCooldown(model) {
-  const state = modelState[model];
-  state.cooldownUntil = Date.now() + COOLDOWN_MS;
-  state.requestsUsed = state.maxRequests; // Mark as fully used
-  console.log(`🔒 ${state.name} FORCED into ${COOLDOWN_MINUTES} minute cooldown (until ${new Date(state.cooldownUntil).toLocaleTimeString()})`);
+  lastRequestTime = Date.now();
+  activeRequests++;
 }
 
 // ===== HELPER FUNCTIONS =====
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ===== RETRY CONFIGURATION (Retries COUNT toward limits) =====
-async function callWithRetry(fn, model) {
-  const state = modelState[model];
-  const maxRetries = state.retriesAllowed;
+// ===== DETAILED ERROR LOGGING =====
+let last429Error = null;
+let lastServerError = null;
+
+// ===== RETRY CONFIGURATION =====
+const MAX_RETRIES = 5; // 5 retries on server errors for all models
+
+async function callWithRetry(fn, nimModel) {
   let lastError;
   
-  // Each attempt (including retries) consumes a request slot
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    // Check if model still has slots available
-    if (state.requestsUsed >= state.maxRequests) {
-      console.log(`⚠️ ${state.name}: No more request slots available for retry`);
-      throw lastError || new Error('No request slots remaining');
-    }
-    
-    // Consume a request slot for this attempt
-    consumeRequestSlot(model);
-    
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const result = await fn();
-      console.log(`✅ ${state.name}: Attempt ${attempt + 1}/${maxRetries + 1} succeeded`);
+      if (attempt > 0) {
+        console.log(`✅ ${nimModel}: Attempt ${attempt + 1}/${MAX_RETRIES + 1} succeeded`);
+      }
       return result;
     } catch (error) {
       lastError = error;
       
       const status = error.response?.status;
       
-      // ===== 429 HANDLING: NO RETRIES, FORCE COOLDOWN =====
+      // ===== 429 HANDLING: NO RETRIES, JUST LOG =====
       if (status === 429) {
         console.log(`\n${'='.repeat(60)}`);
-        console.log(`🚫 429 RATE LIMIT on ${state.name}`);
+        console.log(`🚫 429 RATE LIMIT on ${nimModel}`);
         console.log(`${'='.repeat(60)}`);
         
         if (error.response?.data) {
           console.log(`📦 Body:`, JSON.stringify(error.response.data, null, 2));
         }
         
-        // IMMEDIATELY force cooldown
-        forceCooldown(model);
-        console.log(`🚫 NO RETRIES - Model locked out for ${COOLDOWN_MINUTES} minutes`);
+        if (error.response?.headers) {
+          console.log(`📋 Headers:`);
+          Object.entries(error.response.headers).forEach(([k, v]) => {
+            if (k.startsWith('x-') || k.includes('rate') || k.includes('retry')) {
+              console.log(`   ${k}: ${v}`);
+            }
+          });
+        }
+        
+        last429Error = {
+          timestamp: new Date().toISOString(),
+          model: nimModel,
+          data: error.response?.data,
+          headers: error.response?.headers
+        };
+        
+        console.log(`🚫 NO RETRIES on 429`);
         console.log(`${'='.repeat(60)}\n`);
         throw error;
       }
       
-      // ===== 500, 503, 504 HANDLING: RETRIES COUNT TOWARD LIMIT =====
+      // ===== 500, 503, 504 HANDLING: 5 RETRIES =====
       const isRetryable = status === 500 || status === 503 || status === 504;
       
-      if (!isRetryable || attempt === maxRetries) {
-        console.log(`❌ ${state.name}: All ${attempt + 1} attempts failed (${status}). Moving to next model.`);
+      if (!isRetryable || attempt === MAX_RETRIES) {
+        if (isRetryable) {
+          console.log(`❌ ${nimModel}: All ${MAX_RETRIES + 1} attempts failed (${status}).`);
+        }
+        
+        lastServerError = {
+          timestamp: new Date().toISOString(),
+          model: nimModel,
+          status,
+          attempts: attempt + 1,
+          data: error.response?.data
+        };
+        
         throw error;
       }
       
@@ -211,7 +137,12 @@ async function callWithRetry(fn, model) {
       
       waitTime = Math.min(waitTime, 30000);
       
-      console.log(`⚠️ Server error (${status}) on ${state.name} - attempt ${attempt + 1}/${maxRetries + 1} failed. Retrying in ${Math.round(waitTime/1000)}s... (${state.requestsUsed}/${state.maxRequests} slots used)`);
+      console.log(`⚠️ Server error (${status}) on ${nimModel} - attempt ${attempt + 1}/${MAX_RETRIES + 1} failed. Retrying in ${Math.round(waitTime/1000)}s...`);
+      
+      if (error.response?.data) {
+        console.log(`   Details:`, JSON.stringify(error.response.data).substring(0, 200));
+      }
+      
       await sleep(waitTime);
     }
   }
@@ -225,48 +156,27 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 // Health check
 app.get('/health', (req, res) => {
-  const now = Date.now();
-  
-  const getModelStatus = (modelKey) => {
-    const state = modelState[modelKey];
-    const cooldownRemaining = Math.max(0, state.cooldownUntil - now);
-    return {
-      requests_used: `${state.requestsUsed}/${state.maxRequests}`,
-      requests_remaining: state.maxRequests - state.requestsUsed,
-      on_cooldown: now < state.cooldownUntil,
-      cooldown_remaining: cooldownRemaining > 0 ? `${Math.ceil(cooldownRemaining / 1000)}s (${Math.ceil(cooldownRemaining / 60000)} minutes)` : 'none',
-      available: now >= state.cooldownUntil && state.requestsUsed < state.maxRequests,
-      retries_allowed: state.retriesAllowed,
-      note: `Each request slot can use up to ${state.retriesAllowed + 1} attempts`
-    };
-  };
-  
   res.json({
     status: 'ok',
-    next_in_sequence: modelState[sequence[sequenceIndex]]?.name || 'end of sequence',
-    sequence_position: `${sequenceIndex}/${sequence.length}`,
-    deepseek_v4_pro: getModelStatus(MODEL_PRO),
-    deepseek_v4_flash: getModelStatus(MODEL_FLASH),
-    glm_5_1: getModelStatus(MODEL_GLM),
-    system: {
-      cooldown_minutes: COOLDOWN_MINUTES,
-      retry_policy: {
-        description: 'Retries COUNT toward request limits',
-        pro_flash: '1 retry (2 total attempts per slot) - both count',
-        glm: '2 retries (3 total attempts per slot) - all count',
-        on_429: 'NO RETRIES - Immediate 60 minute cooldown'
-      }
-    }
+    min_delay: `${MIN_DELAY / 1000}s`,
+    active_requests: activeRequests,
+    max_retries: MAX_RETRIES,
+    retry_on_429: false,
+    retry_on_server_errors: '500, 503, 504',
+    last_429_error: last429Error,
+    last_server_error: lastServerError,
+    available_models: Object.keys(MODEL_MAPPING)
   });
 });
 
 // Models endpoint
 app.get('/v1/models', (req, res) => {
-  const models = [
-    { id: 'gpt-3.5-turbo', object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy' },
-    { id: 'gpt-4', object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy' },
-    { id: 'gpt-4o', object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy' }
-  ];
+  const models = Object.keys(MODEL_MAPPING).map(id => ({
+    id,
+    object: 'model',
+    created: Date.now(),
+    owned_by: 'nvidia-nim-proxy'
+  }));
   res.json({ object: 'list', data: models });
 });
 
@@ -281,49 +191,15 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
     }
     
-    // Get next model in sequence
-    const nimModel = getNextModelInSequence();
+    // Resolve the model YOU chose
+    const nimModel = resolveModel(model);
     
-    // If no model is available (all on cooldown or out of requests)
-    if (!nimModel) {
-      const now = Date.now();
-      
-      let soonestModel = null;
-      let soonestTime = Infinity;
-      
-      for (const [key, state] of Object.entries(modelState)) {
-        const cooldownRemaining = Math.max(0, state.cooldownUntil - now);
-        if (cooldownRemaining < soonestTime) {
-          soonestTime = cooldownRemaining;
-          soonestModel = state.name;
-        }
-      }
-      
-      const minutesRemaining = Math.ceil(soonestTime / 60000);
-      const secondsRemaining = Math.ceil(soonestTime / 1000);
-      
-      console.log(`🚫 All models unavailable! Blocking request BEFORE reaching NVIDIA.`);
-      
-      return res.status(429).json({
-        error: {
-          message: `All models are currently on cooldown. ${soonestModel} will be available in ${minutesRemaining} minute(s) (${secondsRemaining} seconds).`,
-          type: 'rate_limit_error',
-          code: 429,
-          retry_after: secondsRemaining,
-          details: {
-            deepseek_v4_pro: modelState[MODEL_PRO].requestsUsed >= modelState[MODEL_PRO].maxRequests ? 'cooldown' : 'available',
-            deepseek_v4_flash: modelState[MODEL_FLASH].requestsUsed >= modelState[MODEL_FLASH].maxRequests ? 'cooldown' : 'available',
-            glm_5_1: modelState[MODEL_GLM].requestsUsed >= modelState[MODEL_GLM].maxRequests ? 'cooldown' : 'available'
-          }
-        }
-      });
-    }
+    console.log(`📤 ${messages.length} messages → ${nimModel.split('/').pop()} (You selected: ${model})`);
     
-    const state = modelState[nimModel];
+    // Wait for rate limit
+    await rateLimit();
     
-    console.log(`📤 ${messages.length} messages → ${state.name} (${state.requestsUsed}/${state.maxRequests} slots used, up to ${state.retriesAllowed + 1} attempts)`);
-    
-    // NO TOKEN LIMITS - NO TRUNCATION
+    // NO TOKEN LIMITS - NO TRUNCATION - NO BLOCKING
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -332,7 +208,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Retries are handled inside callWithRetry and COUNT toward the limit
     const response = await callWithRetry(
       () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
         headers: {
@@ -345,7 +220,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimModel
     );
     
-    console.log(`✅ Success with ${state.name} (${state.requestsUsed}/${state.maxRequests} slots used)`);
+    activeRequests--;
+    console.log(`✅ Success with ${nimModel.split('/').pop()}`);
     
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -354,6 +230,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       response.data.pipe(res);
       response.data.on('error', (err) => {
         console.error('Stream error:', err.message);
+        activeRequests = Math.max(0, activeRequests - 1);
         res.end();
       });
     } else {
@@ -373,6 +250,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
+    activeRequests = Math.max(0, activeRequests - 1);
     console.error('❌ Error:', error.message);
     
     const status = error.response?.status || 500;
@@ -395,15 +273,16 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - 3 Model Rotation (Retries Count Toward Limits)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection`);
   console.log(`📡 Port: ${PORT}`);
-  console.log(`🔢 Limits (each attempt counts):`);
-  console.log(`   • DeepSeek Pro:  ${modelState[MODEL_PRO].maxRequests} slots, ${modelState[MODEL_PRO].retriesAllowed} retry  (max ${modelState[MODEL_PRO].maxRequests} total attempts)`);
-  console.log(`   • DeepSeek Flash: ${modelState[MODEL_FLASH].maxRequests} slots, ${modelState[MODEL_FLASH].retriesAllowed} retry  (max ${modelState[MODEL_FLASH].maxRequests} total attempts)`);
-  console.log(`   • GLM 5.1:       ${modelState[MODEL_GLM].maxRequests} slots, ${modelState[MODEL_GLM].retriesAllowed} retries (max ${modelState[MODEL_GLM].maxRequests} total attempts)`);
-  console.log(`🔒 Cooldown: ${COOLDOWN_MINUTES} minutes after limit reached`);
-  console.log(`🛡️ Cooldown models blocked BEFORE reaching NVIDIA`);
-  console.log(`🚫 429: NO RETRIES - Immediate cooldown`);
-  console.log(`📝 Full context - NO truncation, NO token limits`);
-  console.log(`💡 Health check: /health`);
+  console.log(`📋 Available models:`);
+  for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
+    console.log(`   ${openai} → ${nim.split('/').pop()}`);
+  }
+  console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
+  console.log(`🔄 Max retries: ${MAX_RETRIES} (on 500/503/504)`);
+  console.log(`🚫 429: NO RETRIES - Logged and returned`);
+  console.log(`📝 Full context - NO truncation, NO limits, NO blocking`);
+  console.log(`💡 YOU choose the model manually`);
+  console.log(`🔍 Health check: /health`);
 });
