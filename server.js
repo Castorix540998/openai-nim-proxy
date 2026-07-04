@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Smart Verbose Taming)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Simple)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -25,91 +25,12 @@ const MODEL_MAPPING = {
   'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b'
 };
 
-// ===== VERBOSE MODEL TAMING =====
-const VERBOSE_MODELS = [
-  'z-ai/glm-5.2',
-  'z-ai/glm-5.1',
-  'mistralai/mistral-medium-3.5-128b'
-];
-
-const ANTI_RAMBLING_PROMPT = `[Style instructions: Be concise and direct. Avoid unnecessary descriptions, repetition, filler words, and overly flowery language. Advance the story or conversation naturally without padding. Write only what's needed.]`;
-
-function injectConcisenessInstructions(messages, nimModel) {
-  if (!VERBOSE_MODELS.includes(nimModel)) {
-    return messages;
-  }
-  
-  console.log(`📝 Injecting anti-rambling instructions for ${nimModel.split('/').pop()}`);
-  
-  const hasSystemMessage = messages.some(m => m.role === 'system');
-  
-  if (hasSystemMessage) {
-    return messages.map(m => {
-      if (m.role === 'system') {
-        return {
-          ...m,
-          content: m.content + '\n\n' + ANTI_RAMBLING_PROMPT
-        };
-      }
-      return m;
-    });
-  } else {
-    return [
-      { role: 'system', content: ANTI_RAMBLING_PROMPT },
-      ...messages
-    ];
-  }
-}
-
-// Smart trim at sentence boundaries
-function smartTrim(content, maxChars) {
-  if (content.length <= maxChars) {
-    return content;
-  }
-  
-  console.log(`✂️ Trimming verbose response (${content.length} → ${maxChars} chars)`);
-  
-  // Find the last complete sentence within the limit
-  const truncated = content.substring(0, maxChars);
-  
-  // Try to end at a sentence boundary
-  const sentenceEndings = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '."', '!"', '?"'];
-  let lastGoodEnd = -1;
-  
-  for (const ending of sentenceEndings) {
-    const pos = truncated.lastIndexOf(ending);
-    if (pos > lastGoodEnd) {
-      lastGoodEnd = pos + ending.length - 1; // Include the punctuation but not the space
-    }
-  }
-  
-  // Also try paragraph breaks
-  const lastParagraph = truncated.lastIndexOf('\n\n');
-  if (lastParagraph > lastGoodEnd && lastParagraph > maxChars * 0.7) {
-    lastGoodEnd = lastParagraph;
-  }
-  
-  if (lastGoodEnd > maxChars * 0.5) {
-    // Found a good ending point
-    return truncated.substring(0, lastGoodEnd + 1).trim();
-  }
-  
-  // Fallback: find last space
-  const lastSpace = truncated.lastIndexOf(' ');
-  if (lastSpace > maxChars * 0.8) {
-    return truncated.substring(0, lastSpace) + '...';
-  }
-  
-  // Last resort: just cut and add ellipsis
-  return truncated + '...';
-}
-
 function resolveModel(openaiModel) {
   return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4-flash';
 }
 
 // ===== RATE LIMITING =====
-const MIN_DELAY = 3000;
+const MIN_DELAY = 3000; // 3 seconds between requests
 let lastRequestTime = 0;
 let activeRequests = 0;
 
@@ -137,7 +58,7 @@ let last429Error = null;
 let lastServerError = null;
 
 // ===== RETRY CONFIGURATION =====
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 5; // 5 retries on server errors for all models
 
 async function callWithRetry(fn, nimModel) {
   let lastError;
@@ -154,6 +75,7 @@ async function callWithRetry(fn, nimModel) {
       
       const status = error.response?.status;
       
+      // ===== 429 HANDLING: NO RETRIES, JUST LOG =====
       if (status === 429) {
         console.log(`\n${'='.repeat(60)}`);
         console.log(`🚫 429 RATE LIMIT on ${nimModel}`);
@@ -184,6 +106,7 @@ async function callWithRetry(fn, nimModel) {
         throw error;
       }
       
+      // ===== 500, 503, 504 HANDLING: 5 RETRIES =====
       const isRetryable = status === 500 || status === 503 || status === 504;
       
       if (!isRetryable || attempt === MAX_RETRIES) {
@@ -240,7 +163,6 @@ app.get('/health', (req, res) => {
     max_retries: MAX_RETRIES,
     retry_on_429: false,
     retry_on_server_errors: '500, 503, 504',
-    verbose_models_tamed: VERBOSE_MODELS.map(m => m.split('/').pop()),
     last_429_error: last429Error,
     last_server_error: lastServerError,
     available_models: Object.keys(MODEL_MAPPING)
@@ -272,25 +194,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Resolve the model YOU chose
     const nimModel = resolveModel(model);
     
-    // Inject anti-rambling instructions for verbose models
-    const processedMessages = injectConcisenessInstructions(messages, nimModel);
-    
     console.log(`📤 ${messages.length} messages → ${nimModel.split('/').pop()} (You selected: ${model})`);
     
     // Wait for rate limit
     await rateLimit();
     
     // NO TOKEN LIMITS - NO TRUNCATION - NO BLOCKING
-    // But cap max_tokens for verbose models to prevent rambling
-    const responseMaxTokens = VERBOSE_MODELS.includes(nimModel) 
-      ? Math.min(max_tokens || 2048, 2048)
-      : (max_tokens || 4096);
-    
     const nimRequest = {
       model: nimModel,
-      messages: processedMessages,
+      messages: messages,
       temperature: temperature || 0.6,
-      max_tokens: responseMaxTokens,
+      max_tokens: max_tokens || 4096,
       stream: stream || false
     };
     
@@ -320,13 +234,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      let content = response.data.choices[0]?.message?.content || '';
-      
-      // Smart trim at sentence boundaries for verbose models
-      if (VERBOSE_MODELS.includes(nimModel)) {
-        content = smartTrim(content, 3000);
-      }
-      
+      const content = response.data.choices[0]?.message?.content || '';
       res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -365,18 +273,16 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Smart Verbose Taming)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
-    const isVerbose = VERBOSE_MODELS.includes(nim) ? ' 🎯(tamed)' : '';
-    console.log(`   ${openai} → ${nim.split('/').pop()}${isVerbose}`);
+    console.log(`   ${openai} → ${nim.split('/').pop()}`);
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (on 500/503/504)`);
   console.log(`🚫 429: NO RETRIES - Logged and returned`);
-  console.log(`🎯 Verbose models: 2048 token cap + anti-rambling + smart sentence trim`);
-  console.log(`📝 Full context - NO truncation`);
+  console.log(`📝 Full context - NO truncation, NO limits, NO blocking`);
   console.log(`💡 YOU choose the model manually`);
   console.log(`🔍 Health check: /health`);
 });
