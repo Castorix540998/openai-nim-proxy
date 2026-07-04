@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Verbose Taming)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Smart Verbose Taming)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -26,29 +26,24 @@ const MODEL_MAPPING = {
 };
 
 // ===== VERBOSE MODEL TAMING =====
-// Models known to be overly verbose
 const VERBOSE_MODELS = [
   'z-ai/glm-5.2',
   'z-ai/glm-5.1',
   'mistralai/mistral-medium-3.5-128b'
 ];
 
-// Anti-rambling system prompt injection
 const ANTI_RAMBLING_PROMPT = `[Style instructions: Be concise and direct. Avoid unnecessary descriptions, repetition, filler words, and overly flowery language. Advance the story or conversation naturally without padding. Write only what's needed.]`;
 
 function injectConcisenessInstructions(messages, nimModel) {
-  // Only modify for known verbose models
   if (!VERBOSE_MODELS.includes(nimModel)) {
     return messages;
   }
   
   console.log(`📝 Injecting anti-rambling instructions for ${nimModel.split('/').pop()}`);
   
-  // Check if there's already a system message
   const hasSystemMessage = messages.some(m => m.role === 'system');
   
   if (hasSystemMessage) {
-    // Append to existing system message
     return messages.map(m => {
       if (m.role === 'system') {
         return {
@@ -59,12 +54,54 @@ function injectConcisenessInstructions(messages, nimModel) {
       return m;
     });
   } else {
-    // Add as new system message
     return [
       { role: 'system', content: ANTI_RAMBLING_PROMPT },
       ...messages
     ];
   }
+}
+
+// Smart trim at sentence boundaries
+function smartTrim(content, maxChars) {
+  if (content.length <= maxChars) {
+    return content;
+  }
+  
+  console.log(`✂️ Trimming verbose response (${content.length} → ${maxChars} chars)`);
+  
+  // Find the last complete sentence within the limit
+  const truncated = content.substring(0, maxChars);
+  
+  // Try to end at a sentence boundary
+  const sentenceEndings = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '."', '!"', '?"'];
+  let lastGoodEnd = -1;
+  
+  for (const ending of sentenceEndings) {
+    const pos = truncated.lastIndexOf(ending);
+    if (pos > lastGoodEnd) {
+      lastGoodEnd = pos + ending.length - 1; // Include the punctuation but not the space
+    }
+  }
+  
+  // Also try paragraph breaks
+  const lastParagraph = truncated.lastIndexOf('\n\n');
+  if (lastParagraph > lastGoodEnd && lastParagraph > maxChars * 0.7) {
+    lastGoodEnd = lastParagraph;
+  }
+  
+  if (lastGoodEnd > maxChars * 0.5) {
+    // Found a good ending point
+    return truncated.substring(0, lastGoodEnd + 1).trim();
+  }
+  
+  // Fallback: find last space
+  const lastSpace = truncated.lastIndexOf(' ');
+  if (lastSpace > maxChars * 0.8) {
+    return truncated.substring(0, lastSpace) + '...';
+  }
+  
+  // Last resort: just cut and add ellipsis
+  return truncated + '...';
 }
 
 function resolveModel(openaiModel) {
@@ -246,8 +283,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     // NO TOKEN LIMITS - NO TRUNCATION - NO BLOCKING
     // But cap max_tokens for verbose models to prevent rambling
     const responseMaxTokens = VERBOSE_MODELS.includes(nimModel) 
-      ? Math.min(max_tokens || 2048, 2048)  // Cap verbose models at 2048
-      : (max_tokens || 4096);                // Others get up to 4096
+      ? Math.min(max_tokens || 2048, 2048)
+      : (max_tokens || 4096);
     
     const nimRequest = {
       model: nimModel,
@@ -285,11 +322,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     } else {
       let content = response.data.choices[0]?.message?.content || '';
       
-      // Post-process: trim excessive content from verbose models
-      if (VERBOSE_MODELS.includes(nimModel) && content.length > 3000) {
-        console.log(`✂️ Trimming verbose response (${content.length} chars)`);
-        // Keep the response but trim if excessively long
-        content = content.substring(0, 3000);
+      // Smart trim at sentence boundaries for verbose models
+      if (VERBOSE_MODELS.includes(nimModel)) {
+        content = smartTrim(content, 3000);
       }
       
       res.json({
@@ -330,7 +365,7 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Verbose Taming)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Smart Verbose Taming)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
@@ -340,7 +375,7 @@ app.listen(PORT, () => {
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (on 500/503/504)`);
   console.log(`🚫 429: NO RETRIES - Logged and returned`);
-  console.log(`🎯 Verbose models: Capped at 2048 tokens + anti-rambling instructions`);
+  console.log(`🎯 Verbose models: 2048 token cap + anti-rambling + smart sentence trim`);
   console.log(`📝 Full context - NO truncation`);
   console.log(`💡 YOU choose the model manually`);
   console.log(`🔍 Health check: /health`);
