@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Fast Retries)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Thinking Control)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -27,6 +27,44 @@ const MODEL_MAPPING = {
 
 function resolveModel(openaiModel) {
   return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4.1-flash';
+}
+
+// ===== MODEL-SPECIFIC THINKING CONTROL =====
+// Models that support disabling thinking via chat_template_kwargs
+const THINKING_CONTROL_MODELS = [
+  'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-ai/deepseek-v4-pro-0813',
+  'moonshotai/kimi-k3',
+  'nvidia/nemotron-3-ultra-550b-a55b'
+];
+
+// Models that always think (cannot be disabled)
+const ALWAYS_THINKING_MODELS = [
+  'z-ai/glm-5.3'
+];
+
+function buildNimRequest(nimModel, messages, temperature, max_tokens, stream) {
+  const nimRequest = {
+    model: nimModel,
+    messages: messages,
+    temperature: temperature || 0.6,
+    max_tokens: max_tokens || 4096,
+    stream: stream || false
+  };
+
+  // If the model supports thinking control, disable it
+  if (THINKING_CONTROL_MODELS.includes(nimModel)) {
+    nimRequest.chat_template_kwargs = { enable_thinking: false };
+    console.log(`🚫 Disabled thinking for ${nimModel.split('/').pop()}`);
+  }
+
+  // If the model always thinks, try to minimize its effort
+  if (ALWAYS_THINKING_MODELS.includes(nimModel)) {
+    nimRequest.reasoning_effort = 'low';
+    console.log(`⬇️ Set reasoning_effort to 'low' for ${nimModel.split('/').pop()} (cannot disable thinking)`);
+  }
+
+  return nimRequest;
 }
 
 // ===== RATE LIMITING =====
@@ -60,7 +98,7 @@ let lastServerError = null;
 // ===== RETRY CONFIGURATION =====
 const MAX_RETRIES = 5;
 const RETRY_DELAY_MS = 2500; // FAST: fixed 2.5 second delay between retries
-const REQUEST_TIMEOUT_MS = 120000; // 2 minutes max per attempt (was 10 min)
+const REQUEST_TIMEOUT_MS = 120000; // 2 minutes max per attempt
 
 async function callWithRetry(fn, nimModel) {
   let lastError;
@@ -163,6 +201,10 @@ app.get('/health', (req, res) => {
     request_timeout: `${REQUEST_TIMEOUT_MS / 1000}s per attempt`,
     retry_on_429: false,
     retry_on_server_errors: '500, 501, 502, 503, 504, timeouts',
+    thinking_control: {
+      disable_thinking: THINKING_CONTROL_MODELS.map(m => m.split('/').pop()),
+      always_thinking: ALWAYS_THINKING_MODELS.map(m => m.split('/').pop())
+    },
     last_429_error: last429Error,
     last_server_error: lastServerError,
     available_models: Object.keys(MODEL_MAPPING)
@@ -199,14 +241,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Wait for rate limit
     await rateLimit();
     
-    // NO TOKEN LIMITS - NO TRUNCATION - NO BLOCKING
-    const nimRequest = {
-      model: nimModel,
-      messages: messages,
-      temperature: temperature || 0.6,
-      max_tokens: max_tokens || 4096,
-      stream: stream || false
-    };
+    // Build request with model-specific thinking control
+    const nimRequest = buildNimRequest(nimModel, messages, temperature, max_tokens, stream);
     
     const response = await callWithRetry(
       () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
@@ -215,7 +251,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'Content-Type': 'application/json'
         },
         responseType: stream ? 'stream' : 'json',
-        timeout: REQUEST_TIMEOUT_MS // 2 minutes max per attempt
+        timeout: REQUEST_TIMEOUT_MS
       }),
       nimModel
     );
@@ -273,11 +309,13 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Fast Retries)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Thinking Control)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
-    console.log(`   ${openai} → ${nim.split('/').pop()}`);
+    const thinkingStatus = THINKING_CONTROL_MODELS.includes(nim) ? ' 🚫 (thinking off)' : 
+                           ALWAYS_THINKING_MODELS.includes(nim) ? ' ⬇️ (low effort)' : '';
+    console.log(`   ${openai} → ${nim.split('/').pop()}${thinkingStatus}`);
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (fast ${RETRY_DELAY_MS/1000}s delay)`);
