@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Simple)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Fast Retries)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -26,7 +26,7 @@ const MODEL_MAPPING = {
 };
 
 function resolveModel(openaiModel) {
-  return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4-flash';
+  return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4.1-flash';
 }
 
 // ===== RATE LIMITING =====
@@ -58,7 +58,9 @@ let last429Error = null;
 let lastServerError = null;
 
 // ===== RETRY CONFIGURATION =====
-const MAX_RETRIES = 5; // 5 retries on server errors for all models
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 2500; // FAST: fixed 2.5 second delay between retries
+const REQUEST_TIMEOUT_MS = 120000; // 2 minutes max per attempt (was 10 min)
 
 async function callWithRetry(fn, nimModel) {
   let lastError;
@@ -74,6 +76,7 @@ async function callWithRetry(fn, nimModel) {
       lastError = error;
       
       const status = error.response?.status;
+      const code = error.code;
       
       // ===== 429 HANDLING: NO RETRIES, JUST LOG =====
       if (status === 429) {
@@ -106,18 +109,22 @@ async function callWithRetry(fn, nimModel) {
         throw error;
       }
       
-      // ===== 500, 503, 504 HANDLING: 5 RETRIES =====
-      const isRetryable = status === 500 || status === 503 || status === 504;
+      // ===== 500, 501, 502, 503, 504, TIMEOUT: RETRY FAST =====
+      const isRetryable = 
+        status === 500 || status === 501 || status === 502 || 
+        status === 503 || status === 504 ||
+        code === 'ECONNABORTED' || code === 'ETIMEDOUT' || 
+        code === 'ECONNRESET' || code === 'ENOTFOUND';
       
       if (!isRetryable || attempt === MAX_RETRIES) {
         if (isRetryable) {
-          console.log(`❌ ${nimModel}: All ${MAX_RETRIES + 1} attempts failed (${status}).`);
+          console.log(`❌ ${nimModel}: All ${MAX_RETRIES + 1} attempts failed (${status || code}).`);
         }
         
         lastServerError = {
           timestamp: new Date().toISOString(),
           model: nimModel,
-          status,
+          status: status || code,
           attempts: attempt + 1,
           data: error.response?.data
         };
@@ -125,19 +132,10 @@ async function callWithRetry(fn, nimModel) {
         throw error;
       }
       
-      let waitTime;
-      const retryAfter = error.response?.headers?.['retry-after'];
+      // FAST RETRY: small fixed delay with small jitter
+      const waitTime = RETRY_DELAY_MS + Math.random() * 500;
       
-      if (retryAfter) {
-        waitTime = parseInt(retryAfter) * 1000;
-      } else {
-        waitTime = 3000 * Math.pow(2, attempt);
-        waitTime = waitTime * (0.8 + Math.random() * 0.4);
-      }
-      
-      waitTime = Math.min(waitTime, 30000);
-      
-      console.log(`⚠️ Server error (${status}) on ${nimModel} - attempt ${attempt + 1}/${MAX_RETRIES + 1} failed. Retrying in ${Math.round(waitTime/1000)}s...`);
+      console.log(`⚠️ ${nimModel}: attempt ${attempt + 1}/${MAX_RETRIES + 1} failed (${status || code}). Fast retry in ${Math.round(waitTime/1000)}s...`);
       
       if (error.response?.data) {
         console.log(`   Details:`, JSON.stringify(error.response.data).substring(0, 200));
@@ -161,8 +159,10 @@ app.get('/health', (req, res) => {
     min_delay: `${MIN_DELAY / 1000}s`,
     active_requests: activeRequests,
     max_retries: MAX_RETRIES,
+    retry_delay: `${RETRY_DELAY_MS / 1000}s (fixed, fast)`,
+    request_timeout: `${REQUEST_TIMEOUT_MS / 1000}s per attempt`,
     retry_on_429: false,
-    retry_on_server_errors: '500, 503, 504',
+    retry_on_server_errors: '500, 501, 502, 503, 504, timeouts',
     last_429_error: last429Error,
     last_server_error: lastServerError,
     available_models: Object.keys(MODEL_MAPPING)
@@ -215,7 +215,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'Content-Type': 'application/json'
         },
         responseType: stream ? 'stream' : 'json',
-        timeout: 600000
+        timeout: REQUEST_TIMEOUT_MS // 2 minutes max per attempt
       }),
       nimModel
     );
@@ -273,14 +273,15 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Fast Retries)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
     console.log(`   ${openai} → ${nim.split('/').pop()}`);
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
-  console.log(`🔄 Max retries: ${MAX_RETRIES} (on 500/503/504)`);
+  console.log(`🔄 Max retries: ${MAX_RETRIES} (fast ${RETRY_DELAY_MS/1000}s delay)`);
+  console.log(`⏰ Request timeout: ${REQUEST_TIMEOUT_MS / 1000}s per attempt`);
   console.log(`🚫 429: NO RETRIES - Logged and returned`);
   console.log(`📝 Full context - NO truncation, NO limits, NO blocking`);
   console.log(`💡 YOU choose the model manually`);
