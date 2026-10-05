@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Thinking Control)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Thinking Control + Garbage Detection)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -27,6 +27,37 @@ const MODEL_MAPPING = {
 
 function resolveModel(openaiModel) {
   return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4.1-flash';
+}
+
+// ===== GARBAGE OUTPUT DETECTION =====
+// Detects responses that are essentially just repeated punctuation or single characters
+function isGarbageOutput(content) {
+  if (!content || content.trim().length === 0) return true;
+  
+  const trimmed = content.trim();
+  
+  // If the response is very short, don't flag it (could be legitimate "!")
+  if (trimmed.length < 20) return false;
+  
+  // Count non-punctuation characters
+  const nonPunctuation = trimmed.replace(/[!?.,;:\s]/g, '');
+  const punctuationRatio = 1 - (nonPunctuation.length / trimmed.length);
+  
+  // If >90% of the content is punctuation, it's garbage
+  if (punctuationRatio > 0.9) {
+    console.log(`🗑️ Garbage detected: ${Math.round(punctuationRatio * 100)}% punctuation`);
+    return true;
+  }
+  
+  // Check for single-character repetition
+  const firstChar = trimmed[0];
+  const firstCharCount = trimmed.split(firstChar).length - 1;
+  if (firstCharCount / trimmed.length > 0.9) {
+    console.log(`🗑️ Garbage detected: single character "${firstChar}" repeated`);
+    return true;
+  }
+  
+  return false;
 }
 
 // ===== MODEL-SPECIFIC THINKING CONTROL =====
@@ -94,6 +125,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // ===== DETAILED ERROR LOGGING =====
 let last429Error = null;
 let lastServerError = null;
+let lastGarbageOutput = null;
 
 // ===== RETRY CONFIGURATION =====
 const MAX_RETRIES = 5;
@@ -106,12 +138,44 @@ async function callWithRetry(fn, nimModel) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const result = await fn();
+      
+      // ===== GARBAGE OUTPUT DETECTION =====
+      // Only check non-streaming responses (streaming has no .data.choices)
+      const content = result?.data?.choices?.[0]?.message?.content;
+      if (typeof content === 'string' && isGarbageOutput(content)) {
+        const preview = content.substring(0, 50).replace(/\n/g, '\\n');
+        console.log(`🗑️ ${nimModel}: Garbage output on attempt ${attempt + 1}/${MAX_RETRIES + 1}. Preview: "${preview}..."`);
+        
+        lastGarbageOutput = {
+          timestamp: new Date().toISOString(),
+          model: nimModel,
+          preview,
+          attempt: attempt + 1
+        };
+        
+        if (attempt === MAX_RETRIES) {
+          const garbageError = new Error('Model produced invalid output repeatedly');
+          garbageError.isGarbageError = true;
+          throw garbageError;
+        }
+        
+        const waitTime = RETRY_DELAY_MS + Math.random() * 500;
+        console.log(`🔄 Retrying in ${Math.round(waitTime/1000)}s...`);
+        await sleep(waitTime);
+        continue;
+      }
+      
       if (attempt > 0) {
         console.log(`✅ ${nimModel}: Attempt ${attempt + 1}/${MAX_RETRIES + 1} succeeded`);
       }
       return result;
     } catch (error) {
       lastError = error;
+      
+      // Skip further handling if this is a garbage error (already logged)
+      if (error.isGarbageError) {
+        throw error;
+      }
       
       const status = error.response?.status;
       const code = error.code;
@@ -201,12 +265,14 @@ app.get('/health', (req, res) => {
     request_timeout: `${REQUEST_TIMEOUT_MS / 1000}s per attempt`,
     retry_on_429: false,
     retry_on_server_errors: '500, 501, 502, 503, 504, timeouts',
+    garbage_detection: 'enabled (repeated punctuation/characters)',
     thinking_control: {
       disable_thinking: THINKING_CONTROL_MODELS.map(m => m.split('/').pop()),
       always_thinking: ALWAYS_THINKING_MODELS.map(m => m.split('/').pop())
     },
     last_429_error: last429Error,
     last_server_error: lastServerError,
+    last_garbage_output: lastGarbageOutput,
     available_models: Object.keys(MODEL_MAPPING)
   });
 });
@@ -289,6 +355,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     activeRequests = Math.max(0, activeRequests - 1);
     console.error('❌ Error:', error.message);
     
+    // Special handling for garbage output exhaustion
+    if (error.isGarbageError) {
+      return res.status(503).json({
+        error: {
+          message: 'The model is currently producing corrupted output. Please try again in a few moments or switch to another model.',
+          type: 'model_corruption',
+          code: 503
+        }
+      });
+    }
+    
     const status = error.response?.status || 500;
     
     res.status(status).json({
@@ -309,7 +386,7 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Thinking Control)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Thinking Control + Garbage Detection)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
@@ -319,6 +396,7 @@ app.listen(PORT, () => {
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (fast ${RETRY_DELAY_MS/1000}s delay)`);
+  console.log(`🗑️ Garbage detection: ENABLED (repeated punctuation/characters)`);
   console.log(`⏰ Request timeout: ${REQUEST_TIMEOUT_MS / 1000}s per attempt`);
   console.log(`🚫 429: NO RETRIES - Logged and returned`);
   console.log(`📝 Full context - NO truncation, NO limits, NO blocking`);
