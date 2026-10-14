@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Thinking Control + Garbage Detection)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Garbage Detection)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -60,42 +60,14 @@ function isGarbageOutput(content) {
   return false;
 }
 
-// ===== MODEL-SPECIFIC THINKING CONTROL =====
-// Models that support disabling thinking via chat_template_kwargs
-const THINKING_CONTROL_MODELS = [
-  'deepseek-ai/deepseek-v4.1-flash',
-  'deepseek-ai/deepseek-v4-pro-0813',
-  'moonshotai/kimi-k3',
-  'nvidia/nemotron-3-ultra-550b-a55b'
-];
-
-// Models that always think (cannot be disabled)
-const ALWAYS_THINKING_MODELS = [
-  'z-ai/glm-5.3'
-];
-
 function buildNimRequest(nimModel, messages, temperature, max_tokens, stream) {
-  const nimRequest = {
+  return {
     model: nimModel,
     messages: messages,
     temperature: temperature || 0.6,
     max_tokens: max_tokens || 4096,
     stream: stream || false
   };
-
-  // If the model supports thinking control, disable it
-  if (THINKING_CONTROL_MODELS.includes(nimModel)) {
-    nimRequest.chat_template_kwargs = { enable_thinking: false };
-    console.log(`🚫 Disabled thinking for ${nimModel.split('/').pop()}`);
-  }
-
-  // If the model always thinks, try to minimize its effort
-  if (ALWAYS_THINKING_MODELS.includes(nimModel)) {
-    nimRequest.reasoning_effort = 'low';
-    console.log(`⬇️ Set reasoning_effort to 'low' for ${nimModel.split('/').pop()} (cannot disable thinking)`);
-  }
-
-  return nimRequest;
 }
 
 // ===== RATE LIMITING =====
@@ -266,10 +238,6 @@ app.get('/health', (req, res) => {
     retry_on_429: false,
     retry_on_server_errors: '500, 501, 502, 503, 504, timeouts',
     garbage_detection: 'enabled (repeated punctuation/characters)',
-    thinking_control: {
-      disable_thinking: THINKING_CONTROL_MODELS.map(m => m.split('/').pop()),
-      always_thinking: ALWAYS_THINKING_MODELS.map(m => m.split('/').pop())
-    },
     last_429_error: last429Error,
     last_server_error: lastServerError,
     last_garbage_output: lastGarbageOutput,
@@ -307,7 +275,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Wait for rate limit
     await rateLimit();
     
-    // Build request with model-specific thinking control
+    // Build request
     const nimRequest = buildNimRequest(nimModel, messages, temperature, max_tokens, stream);
     
     const response = await callWithRetry(
@@ -386,13 +354,11 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Thinking Control + Garbage Detection)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Garbage Detection)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
-    const thinkingStatus = THINKING_CONTROL_MODELS.includes(nim) ? ' 🚫 (thinking off)' : 
-                           ALWAYS_THINKING_MODELS.includes(nim) ? ' ⬇️ (low effort)' : '';
-    console.log(`   ${openai} → ${nim.split('/').pop()}${thinkingStatus}`);
+    console.log(`   ${openai} → ${nim.split('/').pop()}`);
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (fast ${RETRY_DELAY_MS/1000}s delay)`);
