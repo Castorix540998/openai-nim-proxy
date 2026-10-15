@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Thinking Effort + Garbage Detection)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Garbage Detection)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -29,111 +29,26 @@ function resolveModel(openaiModel) {
   return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4.1-flash';
 }
 
-// ============================================================
-// 🧠 THINKING EFFORT CONTROL — CHANGE THIS ONE VALUE
-// ------------------------------------------------------------
-// Accepted values:  'Off'  |  'Low'  |  'Medium'  |  'High'  |  'Max'
-//
-//   'Off'    → disables thinking where possible,
-//              falls back to lowest effort for always-thinking models
-//   'Low'    → minimal reasoning
-//   'Medium' → balanced
-//   'High'   → more reasoning
-//   'Max'    → maximum reasoning (currently maps to 'high')
-// ============================================================
-const THINKING_EFFORT = 'Medium';
-// ============================================================
-
-// Models that support fully toggling thinking on/off
-const THINKING_TOGGLE_MODELS = [
-  'deepseek-ai/deepseek-v4.1-flash',
-  'deepseek-ai/deepseek-v4-pro-0813',
-  'moonshotai/kimi-k3',
-  'nvidia/nemotron-3-ultra-550b-a55b'
-];
-
-// Models that always think — only reasoning_effort can be adjusted
-const ALWAYS_THINKING_MODELS = [
-  'z-ai/glm-5.3',
-  'z-ai/glm-5.3-flash'
-];
-
-// User-friendly effort → NIM reasoning_effort values
-// (Change 'Max' mapping if your API accepts a dedicated max level.)
-const EFFORT_MAP = {
-  'Off': 'low',
-  'Low': 'low',
-  'Medium': 'medium',
-  'High': 'high',
-  'Max': 'high'
-};
-
-const VALID_EFFORTS = Object.keys(EFFORT_MAP);
-
-// Normalize the user's setting (case-insensitive) once at startup
-const ACTIVE_EFFORT = VALID_EFFORTS.find(
-  e => e.toLowerCase() === String(THINKING_EFFORT).toLowerCase()
-) || 'Off';
-
-if (!VALID_EFFORTS.some(e => e.toLowerCase() === String(THINKING_EFFORT).toLowerCase())) {
-  console.log(`⚠️ Invalid THINKING_EFFORT "${THINKING_EFFORT}" — falling back to 'Off'`);
-}
-
-function applyThinkingControl(nimRequest, nimModel) {
-  const shortName = nimModel.split('/').pop();
-  const effort = ACTIVE_EFFORT;
-
-  // 1) Models that can toggle thinking on/off
-  if (THINKING_TOGGLE_MODELS.includes(nimModel)) {
-    if (effort === 'Off') {
-      nimRequest.chat_template_kwargs = { enable_thinking: false };
-      console.log(`🚫 Thinking OFF for ${shortName}`);
-    } else {
-      nimRequest.chat_template_kwargs = { enable_thinking: true };
-      nimRequest.reasoning_effort = EFFORT_MAP[effort];
-      console.log(`🧠 Thinking ${effort} for ${shortName}`);
-    }
-    return;
-  }
-
-  // 2) Models that always think — only reasoning_effort applies
-  if (ALWAYS_THINKING_MODELS.includes(nimModel)) {
-    nimRequest.reasoning_effort = EFFORT_MAP[effort];
-    if (effort === 'Off') {
-      console.log(`⬇️ ${shortName} can't fully disable thinking — set to 'low'`);
-    } else {
-      console.log(`🧠 Thinking ${effort} for ${shortName}`);
-    }
-    return;
-  }
-
-  // 3) Unknown model — only send reasoning_effort when not Off
-  if (effort !== 'Off') {
-    nimRequest.reasoning_effort = EFFORT_MAP[effort];
-    console.log(`🧠 Thinking ${effort} for ${shortName}`);
-  }
-}
-
 // ===== GARBAGE OUTPUT DETECTION =====
 // Detects responses that are essentially just repeated punctuation or single characters
 function isGarbageOutput(content) {
   if (!content || content.trim().length === 0) return true;
-  
+
   const trimmed = content.trim();
-  
+
   // If the response is very short, don't flag it (could be legitimate "!")
   if (trimmed.length < 20) return false;
-  
+
   // Count non-punctuation characters
   const nonPunctuation = trimmed.replace(/[!?.,;:\s]/g, '');
   const punctuationRatio = 1 - (nonPunctuation.length / trimmed.length);
-  
+
   // If >90% of the content is punctuation, it's garbage
   if (punctuationRatio > 0.9) {
     console.log(`🗑️ Garbage detected: ${Math.round(punctuationRatio * 100)}% punctuation`);
     return true;
   }
-  
+
   // Check for single-character repetition
   const firstChar = trimmed[0];
   const firstCharCount = trimmed.split(firstChar).length - 1;
@@ -141,23 +56,18 @@ function isGarbageOutput(content) {
     console.log(`🗑️ Garbage detected: single character "${firstChar}" repeated`);
     return true;
   }
-  
+
   return false;
 }
 
 function buildNimRequest(nimModel, messages, temperature, max_tokens, stream) {
-  const nimRequest = {
+  return {
     model: nimModel,
     messages: messages,
     temperature: temperature || 0.6,
     max_tokens: max_tokens || 4096,
     stream: stream || false
   };
-
-  // Apply the single THINKING_EFFORT switch to the request
-  applyThinkingControl(nimRequest, nimModel);
-
-  return nimRequest;
 }
 
 // ===== RATE LIMITING =====
@@ -169,14 +79,14 @@ async function rateLimit() {
   while (activeRequests >= 1) {
     await sleep(500);
   }
-  
+
   const now = Date.now();
   const wait = MIN_DELAY - (now - lastRequestTime);
   if (wait > 0) {
     console.log(`⏳ Cooldown: ${Math.round(wait/1000)}s...`);
     await sleep(wait);
   }
-  
+
   lastRequestTime = Date.now();
   activeRequests++;
 }
@@ -196,62 +106,62 @@ const REQUEST_TIMEOUT_MS = 120000; // 2 minutes max per attempt
 
 async function callWithRetry(fn, nimModel) {
   let lastError;
-  
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const result = await fn();
-      
+
       // ===== GARBAGE OUTPUT DETECTION =====
       // Only check non-streaming responses (streaming has no .data.choices)
       const content = result?.data?.choices?.[0]?.message?.content;
       if (typeof content === 'string' && isGarbageOutput(content)) {
         const preview = content.substring(0, 50).replace(/\n/g, '\\n');
         console.log(`🗑️ ${nimModel}: Garbage output on attempt ${attempt + 1}/${MAX_RETRIES + 1}. Preview: "${preview}..."`);
-        
+
         lastGarbageOutput = {
           timestamp: new Date().toISOString(),
           model: nimModel,
           preview,
           attempt: attempt + 1
         };
-        
+
         if (attempt === MAX_RETRIES) {
           const garbageError = new Error('Model produced invalid output repeatedly');
           garbageError.isGarbageError = true;
           throw garbageError;
         }
-        
+
         const waitTime = RETRY_DELAY_MS + Math.random() * 500;
         console.log(`🔄 Retrying in ${Math.round(waitTime/1000)}s...`);
         await sleep(waitTime);
         continue;
       }
-      
+
       if (attempt > 0) {
         console.log(`✅ ${nimModel}: Attempt ${attempt + 1}/${MAX_RETRIES + 1} succeeded`);
       }
       return result;
     } catch (error) {
       lastError = error;
-      
+
       // Skip further handling if this is a garbage error (already logged)
       if (error.isGarbageError) {
         throw error;
       }
-      
+
       const status = error.response?.status;
       const code = error.code;
-      
+
       // ===== 429 HANDLING: NO RETRIES, JUST LOG =====
       if (status === 429) {
         console.log(`\n${'='.repeat(60)}`);
         console.log(`🚫 429 RATE LIMIT on ${nimModel}`);
         console.log(`${'='.repeat(60)}`);
-        
+
         if (error.response?.data) {
           console.log(`📦 Body:`, JSON.stringify(error.response.data, null, 2));
         }
-        
+
         if (error.response?.headers) {
           console.log(`📋 Headers:`);
           Object.entries(error.response.headers).forEach(([k, v]) => {
@@ -260,31 +170,31 @@ async function callWithRetry(fn, nimModel) {
             }
           });
         }
-        
+
         last429Error = {
           timestamp: new Date().toISOString(),
           model: nimModel,
           data: error.response?.data,
           headers: error.response?.headers
         };
-        
+
         console.log(`🚫 NO RETRIES on 429`);
         console.log(`${'='.repeat(60)}\n`);
         throw error;
       }
-      
+
       // ===== 500, 501, 502, 503, 504, TIMEOUT: RETRY FAST =====
       const isRetryable = 
         status === 500 || status === 501 || status === 502 || 
         status === 503 || status === 504 ||
         code === 'ECONNABORTED' || code === 'ETIMEDOUT' || 
         code === 'ECONNRESET' || code === 'ENOTFOUND';
-      
+
       if (!isRetryable || attempt === MAX_RETRIES) {
         if (isRetryable) {
           console.log(`❌ ${nimModel}: All ${MAX_RETRIES + 1} attempts failed (${status || code}).`);
         }
-        
+
         lastServerError = {
           timestamp: new Date().toISOString(),
           model: nimModel,
@@ -292,19 +202,19 @@ async function callWithRetry(fn, nimModel) {
           attempts: attempt + 1,
           data: error.response?.data
         };
-        
+
         throw error;
       }
-      
+
       // FAST RETRY: small fixed delay with small jitter
       const waitTime = RETRY_DELAY_MS + Math.random() * 500;
-      
+
       console.log(`⚠️ ${nimModel}: attempt ${attempt + 1}/${MAX_RETRIES + 1} failed (${status || code}). Fast retry in ${Math.round(waitTime/1000)}s...`);
-      
+
       if (error.response?.data) {
         console.log(`   Details:`, JSON.stringify(error.response.data).substring(0, 200));
       }
-      
+
       await sleep(waitTime);
     }
   }
@@ -328,13 +238,6 @@ app.get('/health', (req, res) => {
     retry_on_429: false,
     retry_on_server_errors: '500, 501, 502, 503, 504, timeouts',
     garbage_detection: 'enabled (repeated punctuation/characters)',
-    thinking_effort: {
-      active: ACTIVE_EFFORT,
-      valid_options: VALID_EFFORTS,
-      toggle_models: THINKING_TOGGLE_MODELS.map(m => m.split('/').pop()),
-      always_thinking_models: ALWAYS_THINKING_MODELS.map(m => m.split('/').pop()),
-      effort_map: EFFORT_MAP
-    },
     last_429_error: last429Error,
     last_server_error: lastServerError,
     last_garbage_output: lastGarbageOutput,
@@ -357,24 +260,24 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
-    
+
     if (!messages?.length) {
       return res.status(400).json({
         error: { message: 'No messages provided', code: 400 }
       });
     }
-    
+
     // Resolve the model YOU chose
     const nimModel = resolveModel(model);
-    
+
     console.log(`📤 ${messages.length} messages → ${nimModel.split('/').pop()} (You selected: ${model})`);
-    
+
     // Wait for rate limit
     await rateLimit();
-    
-    // Build request (thinking control applied here)
+
+    // Build request
     const nimRequest = buildNimRequest(nimModel, messages, temperature, max_tokens, stream);
-    
+
     const response = await callWithRetry(
       () => axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
         headers: {
@@ -386,10 +289,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       }),
       nimModel
     );
-    
+
     activeRequests--;
     console.log(`✅ Success with ${nimModel.split('/').pop()}`);
-    
+
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -415,11 +318,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         usage: response.data.usage || {}
       });
     }
-    
+
   } catch (error) {
     activeRequests = Math.max(0, activeRequests - 1);
     console.error('❌ Error:', error.message);
-    
+
     // Special handling for garbage output exhaustion
     if (error.isGarbageError) {
       return res.status(503).json({
@@ -430,9 +333,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       });
     }
-    
+
     const status = error.response?.status || 500;
-    
+
     res.status(status).json({
       error: {
         message: error.response?.data?.error?.message || error.message || 'Internal server error',
@@ -451,26 +354,17 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Thinking Effort + Garbage Detection)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Garbage Detection)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
-    let thinkingStatus = '';
-    if (THINKING_TOGGLE_MODELS.includes(nim)) {
-      thinkingStatus = ACTIVE_EFFORT === 'Off' ? ' 🚫 (thinking off)' : ` 🧠 (${ACTIVE_EFFORT})`;
-    } else if (ALWAYS_THINKING_MODELS.includes(nim)) {
-      thinkingStatus = ACTIVE_EFFORT === 'Off'
-        ? ' ⬇️ (low — can\'t fully disable)'
-        : ` 🧠 (${ACTIVE_EFFORT})`;
-    }
-    console.log(`   ${openai} → ${nim.split('/').pop()}${thinkingStatus}`);
+    console.log(`   ${openai} → ${nim.split('/').pop()}`);
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (fast ${RETRY_DELAY_MS/1000}s delay)`);
   console.log(`🗑️ Garbage detection: ENABLED (repeated punctuation/characters)`);
   console.log(`⏰ Request timeout: ${REQUEST_TIMEOUT_MS / 1000}s per attempt`);
   console.log(`🚫 429: NO RETRIES - Logged and returned`);
-  console.log(`🧠 Thinking effort: ${ACTIVE_EFFORT}  (options: ${VALID_EFFORTS.join(' | ')})`);
   console.log(`📝 Full context - NO truncation, NO limits, NO blocking`);
   console.log(`💡 YOU choose the model manually`);
   console.log(`🔍 Health check: /health`);
