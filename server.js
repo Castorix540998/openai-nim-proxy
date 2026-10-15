@@ -1,4 +1,4 @@
-// server.js - NVIDIA NIM Proxy - Manual Model Selection (Garbage Detection)
+// server.js - NVIDIA NIM Proxy - Manual Model Selection (Thinking Effort + Garbage Detection)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -19,7 +19,7 @@ const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4.1-flash',
   'gpt-4': 'minimaxai/minimax-m3',
   'gpt-4-turbo': 'moonshotai/kimi-k3',
-  'gpt-4o': 'stepfun-ai/step-5-preview',
+  'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
   'claude-3-opus': 'z-ai/glm-5.3-flash',
   'claude-3-sonnet': 'z-ai/glm-5.3',
   'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b'
@@ -27,6 +27,91 @@ const MODEL_MAPPING = {
 
 function resolveModel(openaiModel) {
   return MODEL_MAPPING[openaiModel] || 'deepseek-ai/deepseek-v4.1-flash';
+}
+
+// ============================================================
+// 🧠 THINKING EFFORT CONTROL — CHANGE THIS ONE VALUE
+// ------------------------------------------------------------
+// Accepted values:  'Off'  |  'Low'  |  'Medium'  |  'High'  |  'Max'
+//
+//   'Off'    → disables thinking where possible,
+//              falls back to lowest effort for always-thinking models
+//   'Low'    → minimal reasoning
+//   'Medium' → balanced
+//   'High'   → more reasoning
+//   'Max'    → maximum reasoning (currently maps to 'high')
+// ============================================================
+const THINKING_EFFORT = 'Medium';
+// ============================================================
+
+// Models that support fully toggling thinking on/off
+const THINKING_TOGGLE_MODELS = [
+  'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-ai/deepseek-v4-pro-0813',
+  'moonshotai/kimi-k3',
+  'nvidia/nemotron-3-ultra-550b-a55b'
+];
+
+// Models that always think — only reasoning_effort can be adjusted
+const ALWAYS_THINKING_MODELS = [
+  'z-ai/glm-5.3',
+  'z-ai/glm-5.3-flash'
+];
+
+// User-friendly effort → NIM reasoning_effort values
+// (Change 'Max' mapping if your API accepts a dedicated max level.)
+const EFFORT_MAP = {
+  'Off': 'low',
+  'Low': 'low',
+  'Medium': 'medium',
+  'High': 'high',
+  'Max': 'high'
+};
+
+const VALID_EFFORTS = Object.keys(EFFORT_MAP);
+
+// Normalize the user's setting (case-insensitive) once at startup
+const ACTIVE_EFFORT = VALID_EFFORTS.find(
+  e => e.toLowerCase() === String(THINKING_EFFORT).toLowerCase()
+) || 'Off';
+
+if (!VALID_EFFORTS.some(e => e.toLowerCase() === String(THINKING_EFFORT).toLowerCase())) {
+  console.log(`⚠️ Invalid THINKING_EFFORT "${THINKING_EFFORT}" — falling back to 'Off'`);
+}
+
+function applyThinkingControl(nimRequest, nimModel) {
+  const shortName = nimModel.split('/').pop();
+  const effort = ACTIVE_EFFORT;
+
+  // 1) Models that can toggle thinking on/off
+  if (THINKING_TOGGLE_MODELS.includes(nimModel)) {
+    if (effort === 'Off') {
+      nimRequest.chat_template_kwargs = { enable_thinking: false };
+      console.log(`🚫 Thinking OFF for ${shortName}`);
+    } else {
+      nimRequest.chat_template_kwargs = { enable_thinking: true };
+      nimRequest.reasoning_effort = EFFORT_MAP[effort];
+      console.log(`🧠 Thinking ${effort} for ${shortName}`);
+    }
+    return;
+  }
+
+  // 2) Models that always think — only reasoning_effort applies
+  if (ALWAYS_THINKING_MODELS.includes(nimModel)) {
+    nimRequest.reasoning_effort = EFFORT_MAP[effort];
+    if (effort === 'Off') {
+      console.log(`⬇️ ${shortName} can't fully disable thinking — set to 'low'`);
+    } else {
+      console.log(`🧠 Thinking ${effort} for ${shortName}`);
+    }
+    return;
+  }
+
+  // 3) Unknown model — only send reasoning_effort when not Off
+  if (effort !== 'Off') {
+    nimRequest.reasoning_effort = EFFORT_MAP[effort];
+    console.log(`🧠 Thinking ${effort} for ${shortName}`);
+  }
 }
 
 // ===== GARBAGE OUTPUT DETECTION =====
@@ -61,13 +146,18 @@ function isGarbageOutput(content) {
 }
 
 function buildNimRequest(nimModel, messages, temperature, max_tokens, stream) {
-  return {
+  const nimRequest = {
     model: nimModel,
     messages: messages,
     temperature: temperature || 0.6,
     max_tokens: max_tokens || 4096,
     stream: stream || false
   };
+
+  // Apply the single THINKING_EFFORT switch to the request
+  applyThinkingControl(nimRequest, nimModel);
+
+  return nimRequest;
 }
 
 // ===== RATE LIMITING =====
@@ -238,6 +328,13 @@ app.get('/health', (req, res) => {
     retry_on_429: false,
     retry_on_server_errors: '500, 501, 502, 503, 504, timeouts',
     garbage_detection: 'enabled (repeated punctuation/characters)',
+    thinking_effort: {
+      active: ACTIVE_EFFORT,
+      valid_options: VALID_EFFORTS,
+      toggle_models: THINKING_TOGGLE_MODELS.map(m => m.split('/').pop()),
+      always_thinking_models: ALWAYS_THINKING_MODELS.map(m => m.split('/').pop()),
+      effort_map: EFFORT_MAP
+    },
     last_429_error: last429Error,
     last_server_error: lastServerError,
     last_garbage_output: lastGarbageOutput,
@@ -275,7 +372,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Wait for rate limit
     await rateLimit();
     
-    // Build request
+    // Build request (thinking control applied here)
     const nimRequest = buildNimRequest(nimModel, messages, temperature, max_tokens, stream);
     
     const response = await callWithRetry(
@@ -354,17 +451,26 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NIM Proxy - Manual Model Selection (Garbage Detection)`);
+  console.log(`🚀 NIM Proxy - Manual Model Selection (Thinking Effort + Garbage Detection)`);
   console.log(`📡 Port: ${PORT}`);
   console.log(`📋 Available models:`);
   for (const [openai, nim] of Object.entries(MODEL_MAPPING)) {
-    console.log(`   ${openai} → ${nim.split('/').pop()}`);
+    let thinkingStatus = '';
+    if (THINKING_TOGGLE_MODELS.includes(nim)) {
+      thinkingStatus = ACTIVE_EFFORT === 'Off' ? ' 🚫 (thinking off)' : ` 🧠 (${ACTIVE_EFFORT})`;
+    } else if (ALWAYS_THINKING_MODELS.includes(nim)) {
+      thinkingStatus = ACTIVE_EFFORT === 'Off'
+        ? ' ⬇️ (low — can\'t fully disable)'
+        : ` 🧠 (${ACTIVE_EFFORT})`;
+    }
+    console.log(`   ${openai} → ${nim.split('/').pop()}${thinkingStatus}`);
   }
   console.log(`⏱️ Min delay: ${MIN_DELAY / 1000}s between requests`);
   console.log(`🔄 Max retries: ${MAX_RETRIES} (fast ${RETRY_DELAY_MS/1000}s delay)`);
   console.log(`🗑️ Garbage detection: ENABLED (repeated punctuation/characters)`);
   console.log(`⏰ Request timeout: ${REQUEST_TIMEOUT_MS / 1000}s per attempt`);
   console.log(`🚫 429: NO RETRIES - Logged and returned`);
+  console.log(`🧠 Thinking effort: ${ACTIVE_EFFORT}  (options: ${VALID_EFFORTS.join(' | ')})`);
   console.log(`📝 Full context - NO truncation, NO limits, NO blocking`);
   console.log(`💡 YOU choose the model manually`);
   console.log(`🔍 Health check: /health`);
