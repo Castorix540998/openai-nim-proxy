@@ -22,7 +22,7 @@ const MODEL_MAPPING = {
   'gpt-4o': 'stepfun-ai/step-5-preview',
   'claude-3-opus': 'z-ai/glm-5.3-flash',
   'claude-3-sonnet': 'z-ai/glm-5.3',
-  'gemini-pro': 'nvidia/nemotron-3-ultra-550b-a55b'
+  'gemini-pro': 'nvidia/nemotron-3.5-super-vl-120b-a12b'
 };
 
 function resolveModel(openaiModel) {
